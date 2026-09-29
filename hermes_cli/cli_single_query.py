@@ -12,10 +12,18 @@ import logging
 import os
 import sys
 import time
-from agent.interrupt_compat import request_hard_interrupt
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+
+from agent.interrupt_compat import request_hard_interrupt
+
+try:
+    import asyncio as _asyncio
+
+    _TIMEOUT_TYPES = (TimeoutError, _asyncio.TimeoutError)
+except Exception:  # pragma: no cover - asyncio always importable on supported runtimes
+    _TIMEOUT_TYPES = (TimeoutError,)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cli")
@@ -446,8 +454,35 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
     # full timeout. See #86878.
     os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
     from hermes_cli.quiet_single_query import exit_single_query
+    # Per-run structured trace (specs/trace-schema.md v1): open at dispatch entry so
+    # every terminal path below — kanban terminal call, exception crash, or the signal
+    # handler's os._exit — resolves to exactly one appended record.
+    from agent import run_trace as _run_trace
+
+    _kanban_task_env = os.environ.get("HERMES_KANBAN_TASK", "").strip() or None
+    _run_trace_ctx = _run_trace.start_run_trace(
+        run_id=_int_or(os.environ.get("HERMES_KANBAN_RUN_ID"), 0) or None,
+        profile_slug=os.environ.get("HERMES_PROFILE") or "",
+        board_slug=os.environ.get("HERMES_KANBAN_BOARD") or None,
+        task_id=_kanban_task_env,
+    )
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        from tools.kanban_tools import register_current_worker_from_env
+        if not register_current_worker_from_env():
+            # No exit trailer: the task log now belongs to the run that replaced this one.
+            print("kanban: this worker's run was reclaimed before it started; exiting", file=sys.stderr)
+            sys.exit(0)
+
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
         exit_single_query(1)
+    if _run_trace_ctx is not None:
+        with suppress(Exception):
+            _run_trace_ctx.set_identity(
+                session_id=str(getattr(cli, "session_id", "") or ""),
+                model=str(getattr(cli, "model", "") or ""),
+                provider=str(getattr(cli, "provider", "") or ""),
+            )
+    _trace_exc: "BaseException | None" = None
     try:
         query, single_query_images = _collect_query_images(query, image)
         single_query_image_urls = _collect_kanban_task_images(single_query_images)
@@ -500,6 +535,27 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(cli._last_turn_result))
+        exit_single_query(_single_query_exit_code(
+            cli._last_turn_result,
+            credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False)))
+    except BaseException as exc:  # record first, re-raise — the trace must not swallow the failure
+        _trace_exc = exc
+        raise
     finally:
+        if _run_trace is not None:
+            with suppress(Exception):
+                if _trace_exc is None:
+                    # The kanban terminal handlers already closed the trace with the
+                    # real outcome; this no-ops (emit-once) on that path.
+                    _run_trace.close_run_trace("completed", agent=getattr(cli, "agent", None))
+                else:
+                    _is_timeout = isinstance(_trace_exc, _TIMEOUT_TYPES) or (
+                        type(_trace_exc).__name__ == "CancelledError"
+                    )
+                    _run_trace.close_run_trace(
+                        "timeout" if _is_timeout else "crashed",
+                        agent=getattr(cli, "agent", None),
+                        error=_trace_exc,
+                        exit_code=130 if isinstance(_trace_exc, KeyboardInterrupt) else 1,
+                    )
         _finalize_single_query(cli)
