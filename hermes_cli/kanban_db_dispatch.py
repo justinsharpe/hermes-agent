@@ -108,6 +108,13 @@ class DispatchResult:
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
+    reconciled_claims: list[str] = field(default_factory=list)
+    """Non-running cards whose residual (dead-worker) claim lock was released
+    by :func:`reconcile_orphaned_claims` — the gateway-restart / external-sweep
+    wedge class that starved boards until a manual sweep."""
+    closed_orphaned_runs: list[int] = field(default_factory=list)
+    """Run-row ids closed by :func:`close_orphaned_runs` — run rows left open
+    on cards that no longer own them (same wedge class, other half)."""
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
@@ -906,6 +913,203 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
+
+
+# Cards in these statuses are never dispatched from: a residual claim there
+# can only be a leak (external sweep / crash between bookkeeping statements),
+# never legitimate ownership the dispatcher must respect for lane purposes.
+_ORPHAN_CLAIM_STATUSES = ("todo", "ready", "blocked", "review")
+
+
+def _claim_is_host_local(lock: str, host_prefix: str) -> bool:
+    """True when ``lock`` was issued by THIS host.
+
+    macOS hostname flips between the mDNS long form (``Sharpe-Studio.local``)
+    and the short form (``Sharpe-Studio``) across sleep/wake and network
+    changes, and ``socket.gethostname()`` follows whichever is current — so a
+    board can carry locks from BOTH forms of the same machine. A bare
+    ``startswith(host_prefix)`` test would then skip same-host zombies as
+    "foreign" (the wedge lived on exactly this gap: stranded locks from
+    ``Sharpe-Studio:`` never matched the ``Sharpe-Studio.local:`` of the
+    sweeping tick). Normalize both sides to the first DNS label.
+    """
+    if not lock:
+        return False
+    if lock.startswith(host_prefix):
+        return True
+    lock_host = lock.split(":", 1)[0]
+    prefix_host = host_prefix.rstrip(":")
+    return lock_host.split(".", 1)[0] == prefix_host.split(".", 1)[0]
+
+
+def reconcile_orphaned_claims(conn: sqlite3.Connection) -> list[str]:
+    """Release residual claim locks stranded on NON-running cards; ids swept.
+
+    Gateway restarts and external fleet sweeps (a cost breaker blocking every
+    live card with raw SQL, a manual rescue) flip a claimed card's ``status``
+    without clearing ``claim_lock`` / ``worker_pid`` and without closing the
+    open run row. Every ordinary reclaim path gates on ``status = 'running'``,
+    so the stranded lock is invisible to all of them and ``_lane_rows``
+    (``claim_lock IS NULL``) can never claim the card again: the board starves
+    until a human sweeps by hand, while ``recompute_ready`` keeps firing
+    ``promoted`` events for the unclaimable card ("promoted into the void").
+
+    Host-local claims whose worker is STILL ALIVE are never touched — the lock
+    is real ownership (a duplicate would spawn beside it). The release, the
+    leaked-run close, and the worker-PID wipe happen in ONE transaction (the
+    sealed lesson: worker-death => run-row-close + lock-clear must be atomic),
+    and the card keeps its current status: it was already parked there by
+    whatever wrote the status flip; this sweep only removes the dead claim so
+    the ordinary lifecycle (unblock/promote/claim) can proceed.
+    """
+    now = int(time.time())
+    swept: list[str] = []
+    placeholders = ", ".join("?" for _ in _ORPHAN_CLAIM_STATUSES)
+    rows = conn.execute(
+        f"SELECT id, status, claim_lock, claim_expires, worker_pid, "
+        f"       worker_started_at, current_run_id, assignee "
+        f"FROM tasks "
+        f"WHERE status IN ({placeholders}) AND claim_lock IS NOT NULL",
+        _ORPHAN_CLAIM_STATUSES,
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        lock = row["claim_lock"] or ""
+        host_prefix = _kb._host_prefix()
+        if not _claim_is_host_local(lock, host_prefix):
+            # Another host's worker: its liveness is unobservable from here.
+            # Leave the claim; that host's dispatcher owns the ground.
+            continue
+        pid = row["worker_pid"]
+        started_at = _kb._row_get(row, "worker_started_at")
+        if pid and _worker_alive(pid, started_at):
+            # Never release a live worker's claim, whatever the status column
+            # says — the external flip does not un-own the running process.
+            _kb._log.debug(
+                "kanban orphan-claim sweep: task %s carries claim %r with a "
+                "live pid %s — deferring", tid, lock, pid,
+            )
+            continue
+        with _kb.write_txn(conn):
+            # Re-read inside the txn: the card may have been claimed (status
+            # -> running) or completed between the outer read and this txn.
+            # The run is closed FIRST (``_end_run`` locates it via
+            # ``current_run_id`` and clears that column); the claim release
+            # then CASes on the lock so a concurrent claim can never lose.
+            fresh = conn.execute(
+                f"SELECT status, claim_lock, worker_pid, current_run_id "
+                f"FROM tasks WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            if (
+                fresh is None
+                or fresh["claim_lock"] != lock
+                or fresh["worker_pid"] != pid
+                or fresh["current_run_id"] != row["current_run_id"]
+                or fresh["status"] not in _ORPHAN_CLAIM_STATUSES
+            ):
+                continue
+            payload = {
+                "reason": "orphaned_claim",
+                "status": fresh["status"],
+                "claim_lock": lock,
+                "claim_expires": _kb._opt_int(row["claim_expires"]),
+                "worker_pid": int(pid) if pid else None,
+                "now": now,
+            }
+            run_id = _kb._end_run(
+                conn, tid,
+                outcome="reclaimed", status="reclaimed",
+                error="orphaned claim on a non-running card (dead/gone worker)",
+                metadata=payload,
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_started_at = NULL, "
+                "current_run_id = NULL "
+                "WHERE id = ? AND status IN "
+                f"({', '.join('?' for _ in _ORPHAN_CLAIM_STATUSES)}) "
+                "  AND claim_lock IS ?",
+                (tid, *_ORPHAN_CLAIM_STATUSES, lock),
+            )
+            if cur.rowcount != 1:
+                continue
+            _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
+            swept.append(tid)
+        _kb._log.info(
+            "kanban orphan-claim sweep: released dead claim %r from task %s "
+            "(status=%s, worker_pid=%r); card is claimable again",
+            lock, tid, row["status"], pid,
+        )
+    return swept
+
+
+def close_orphaned_runs(conn: sqlite3.Connection) -> list[int]:
+    """Close run rows no live task owns; the run ids closed.
+
+    The other half of the gateway-restart wedge class: an external sweep (or a
+    crash between bookkeeping statements) can leave ``task_runs`` rows
+    ``status='running'`` / ``ended_at IS NULL`` on cards that no longer point
+    at them (``tasks.current_run_id`` cleared or moved on). No legitimate
+    closer ever fires for such a row — the card is not ``running``, so every
+    reclaim path skips it — and the open row feeds the phantom-stall
+    watchdog with 10k-minute "stalls" on done cards.
+
+    A row whose recorded worker is STILL ALIVE on this host is deferred (never
+    close a run beside a live process); ``reap_terminal_workers`` owns the
+    terminal-survivor ground.
+    """
+    now = int(time.time())
+    closed: list[int] = []
+    rows = conn.execute(
+        "SELECT r.id AS run_id, r.task_id, r.worker_pid, r.claim_lock "
+        "FROM task_runs r "
+        "LEFT JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.status = 'running' AND r.ended_at IS NULL "
+        "  AND NOT (t.status = 'running' AND t.current_run_id = r.id)"
+    ).fetchall()
+    for row in rows:
+        pid = row["worker_pid"]
+        lock = row["claim_lock"] or ""
+        # Host-local liveness only: another host's PID is unobservable here,
+        # and a foreign claim means that host's dispatcher owns the ground.
+        if _claim_is_host_local(lock, _kb._host_prefix()) and pid and _worker_alive(
+            pid, None,
+        ) and not _pid_recycled(pid, None):
+            _kb._log.debug(
+                "kanban orphan-run sweep: run %s (task %s) still has a live "
+                "worker pid %s — deferring", row["run_id"], row["task_id"], pid,
+            )
+            continue
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs "
+                "   SET status = 'reclaimed', outcome = 'reclaimed', "
+                "       ended_at = ?, last_heartbeat_at = NULL, "
+                "       claim_expires = NULL "
+                " WHERE id = ? AND status = 'running' AND ended_at IS NULL "
+                "   AND NOT EXISTS ("
+                "     SELECT 1 FROM tasks t "
+                "      WHERE t.id = task_runs.task_id "
+                "        AND t.status = 'running' "
+                "        AND t.current_run_id = task_runs.id"
+                "   )",
+                (now, row["run_id"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            _kb._append_event(
+                conn, row["task_id"], "orphaned_run_closed",
+                {"run_id": row["run_id"], "worker_pid": int(pid) if pid else None,
+                 "now": now},
+                run_id=row["run_id"],
+            )
+            closed.append(row["run_id"])
+        _kb._log.info(
+            "kanban orphan-run sweep: closed leaked run %s on task %s",
+            row["run_id"], row["task_id"],
+        )
+    return closed
 
 
 def _error_fingerprint(error_text: str) -> str:
@@ -2155,6 +2359,15 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Residual claim locks stranded on NON-running cards (gateway restart /
+    # external sweep flipped the status without clearing the claim): release
+    # BEFORE promotion so ``recompute_ready`` only ever promotes claimable
+    # cards — this is the fix for the "promoted into the void" wedges.
+    result.reconciled_claims = reconcile_orphaned_claims(conn)
+    # Run rows left open on cards that no longer own them (same wedge class,
+    # other half): close them so the phantom-stall watchdog stops seeing
+    # 10k-minute "stalls" on non-running cards.
+    result.closed_orphaned_runs = close_orphaned_runs(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
