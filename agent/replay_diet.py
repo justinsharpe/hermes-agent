@@ -32,19 +32,32 @@ logger = logging.getLogger(__name__)
 
 # Resolved ``replay_diet.tool_calls_max_args_chars`` per profile home (the multiplexed
 # gateway serves every profile from one process — a single slot would hand the launch
-# profile's diet to every other profile). 0 = off. Mirrors tools/tool_output_limits.py.
+# profile's diet to every other profile). 0 = off. Mirrors tools/tool_output_limits.py,
+# but additionally keyed on the config.yaml file signature so a mid-flight config edit
+# is live on the next send (the send path calls this once per request).
 _cached_limits: Dict[str, int] = {}
+_cached_signatures: Dict[str, tuple] = {}
 DEFAULT_TOOL_CALLS_MAX_ARGS_CHARS = 0  # off: unset config is byte-identical to pre-feature
 
 
 def get_replay_diet_limits() -> int:
-    """Resolved ``tool_calls_max_args_chars``; never raises. 0 = lever off."""
+    """Resolved ``tool_calls_max_args_chars``; never raises. 0 = lever off.
+
+    Cached per profile home + config.yaml file signature: an unchanged file is a dict
+    hit (~free on the send path), a mid-flight config edit is picked up live.
+    """
     from hermes_constants import hermes_home_key
 
     key = hermes_home_key()
-    cached = _cached_limits.get(key)
-    if cached is not None:
-        return cached
+    try:
+        from hermes_cli.config import get_config_path
+        from utils import file_signature
+
+        sig = file_signature(get_config_path().stat())
+    except Exception:
+        sig = ()
+    if _cached_limits.get(key) is not None and _cached_signatures.get(key) == sig:
+        return _cached_limits[key]
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -58,6 +71,7 @@ def get_replay_diet_limits() -> int:
     except (TypeError, ValueError):
         value = DEFAULT_TOOL_CALLS_MAX_ARGS_CHARS
     _cached_limits[key] = value
+    _cached_signatures[key] = sig
     return value
 
 
