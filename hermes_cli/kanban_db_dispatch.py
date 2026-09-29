@@ -1062,7 +1062,8 @@ def close_orphaned_runs(conn: sqlite3.Connection) -> list[int]:
     now = int(time.time())
     closed: list[int] = []
     rows = conn.execute(
-        "SELECT r.id AS run_id, r.task_id, r.worker_pid, r.claim_lock "
+        "SELECT r.id AS run_id, r.task_id, r.worker_pid, r.claim_lock, "
+        "       r.worker_started_at, r.started_at "
         "FROM task_runs r "
         "LEFT JOIN tasks t ON t.id = r.task_id "
         "WHERE r.status = 'running' AND r.ended_at IS NULL "
@@ -1071,16 +1072,31 @@ def close_orphaned_runs(conn: sqlite3.Connection) -> list[int]:
     for row in rows:
         pid = row["worker_pid"]
         lock = row["claim_lock"] or ""
+        started = _kb._row_get(row, "worker_started_at")
         # Host-local liveness only: another host's PID is unobservable here,
         # and a foreign claim means that host's dispatcher owns the ground.
         if _claim_is_host_local(lock, _kb._host_prefix()) and pid and _worker_alive(
-            pid, None,
-        ) and not _pid_recycled(pid, None):
-            _kb._log.debug(
-                "kanban orphan-run sweep: run %s (task %s) still has a live "
-                "worker pid %s — deferring", row["run_id"], row["task_id"], pid,
+            pid, started,
+        ) and not _pid_recycled(pid, started):
+            # Still alive by the existence probe. For a LEGACY row (NULL
+            # fingerprint) the existence answer cannot distinguish our dead
+            # worker from a recycled PID (the machine's own ControlCenter /
+            # postgres now owns the number), so fall back to the
+            # no-observable-progress backstop ``release_stale_claims`` uses:
+            # a heartbeat older than the max-stale threshold means nothing
+            # has touched this run in over an hour — close it even if some
+            # process holds the PID. Fingerprinted rows keep the strict
+            # answer above (the fingerprint proves recycle vs. ours).
+            hb = _kb._row_get(row, "last_heartbeat_at") or _kb._row_get(row, "started_at")
+            legacy_idle = started is None and hb is not None and (
+                now - int(hb) > _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
             )
-            continue
+            if not legacy_idle:
+                _kb._log.debug(
+                    "kanban orphan-run sweep: run %s (task %s) still has a live "
+                    "worker pid %s — deferring", row["run_id"], row["task_id"], pid,
+                )
+                continue
         with _kb.write_txn(conn):
             cur = conn.execute(
                 "UPDATE task_runs "
