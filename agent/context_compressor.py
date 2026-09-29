@@ -736,8 +736,27 @@ _SUMMARY_INPUT_MAX_CHARS = 160_000
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 
+# Distill-beyond-window stub (CONTEXT-DIET-SPEC-v1 §4 lever 2): a one-line replacement
+# for a tool result scrolled past the protected window. It never deletes information —
+# the full bytes stay in state.db (the prune commits via archive_and_compact, which
+# soft-archives the original rows: active=0, compacted=1, still FTS-searchable) — it
+# relocates the default location and leaves the recall pointers the model needs to
+# fetch the bytes back: result_id, tool, gist, byte location.
+_DISTILL_STUB_PREFIX = "[pruned:"
+_DISTILL_STUB_TEMPLATE = (
+    "[pruned: result_id={result_id} tool={tool} {gist} — full {total:,} chars in state.db "
+    "(session_search result_id:{result_id} or tool-role LIKE recall)]"
+)
+
+
 def _is_summary_stub(content: str) -> bool:
-    """True for a tool result already replaced by a 1-line ``[tool] ... (N chars)`` summary."""
+    """True for a tool result already replaced by a 1-line ``[tool] ... (N chars)`` summary.
+
+    Also recognizes the recall-pointer distill stub (CONTEXT-DIET §4 lever 2) by its
+    ``[pruned`` sigil — same one-line class, never re-summarized.
+    """
+    if content.startswith(_DISTILL_STUB_PREFIX):
+        return True
     return content.startswith("[") and " chars)" in content and len(content) < 400
 
 
@@ -1790,6 +1809,28 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
         return summarizer(tool_name, args, content, content_len, line_count)
     first_arg = "".join(f" {k}={str(v)[:40]}" for k, v in list(args.items())[:2])
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
+
+
+def _distill_result_stub(result_id: Any, tool_name: str, tool_args: str, tool_content: str) -> str:
+    """Distill-beyond-window stub (CONTEXT-DIET-SPEC-v1 §4 lever 2): one line + recall pointers.
+
+    Shape: ``[pruned: result_id=<id> tool=<name> <gist> — full N chars in state.db
+    (session_search result_id:<id> or tool-role LIKE recall)]``. The gist reuses the
+    deterministic per-tool summarizers (no LLM, never crashes); the pointers name the
+    three recall coordinates (result_id, tool, byte location) so the model can fetch
+    the original bytes from state.db without guessing. Deterministic: the same stored
+    result always distills to the same stub bytes.
+    """
+    content = tool_content if isinstance(tool_content, str) else ""
+    gist = _summarize_tool_result(str(tool_name), tool_args, content)
+    # The nested summarizer line already carries its own [tool] bracket and length;
+    # strip a leading bracket run so the stub reads as one bracketed line, and cap the
+    # gist so the stub stays a true one-liner (~400 chars class).
+    gist = gist.lstrip("[").strip()
+    if len(gist) > 220:
+        gist = gist[:217] + "..."
+    rid = str(result_id or "").strip() or "unknown"
+    return _DISTILL_STUB_TEMPLATE.format(result_id=rid, tool=str(tool_name or "unknown"), gist=gist, total=len(content))
 
 
 def _model_threshold_key_rank(key: str, model: str, provider: str) -> "tuple[int, int] | None":
@@ -2955,9 +2996,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     def _demote_tool_result_at(
         result: List[Dict[str, Any]], idx: int, call_id_to_tool: Dict[str, tuple[str, str]],
         min_prune_chars: int, protected_skills: Optional[set[str]] = None,
+        distill_ptrs: bool = False,
     ) -> bool:
         """Replace the tool result at ``idx`` with a 1-line summary; True if modified.
-        ``protected_skills`` (lower-cased) spares matching skill_view bodies; None (pressure pass) overrides the guard."""
+
+        ``protected_skills`` (lower-cased) spares matching skill_view bodies; None (pressure pass) overrides the guard.
+        ``distill_ptrs=True`` emits the recall-pointer distill stub (CONTEXT-DIET §4 lever 2:
+        result_id + tool + gist + byte location; full bytes live on in state.db via the
+        archive commit) instead of the plain summary line."""
         msg = result[idx]
         if msg.get("role") != "tool":
             return False
@@ -2979,7 +3025,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             _skill = _json_dict(tool_args).get("name", "")
             if isinstance(_skill, str) and _skill.lower() in protected_skills:
                 return False
-        result[idx] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
+        if distill_ptrs:
+            result[idx] = {**msg, "content": _distill_result_stub(
+                msg.get("tool_call_id", ""), tool_name, tool_args, content)}
+        else:
+            result[idx] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
         return True
 
     def _tail_soft_ceiling(self, token_budget: int) -> int:
@@ -3045,9 +3095,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None, min_prune_chars: int = _PRUNE_MIN_CHARS,
+        distill_ptrs: bool = False,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Old tool results -> 1-line summaries; dedup, arg truncation, pressure demotion. Returns ``(messages, count)``.
-        Token budget (when given) takes priority over the message-count floor."""
+        Token budget (when given) takes priority over the message-count floor.
+        ``distill_ptrs=True`` (CONTEXT-DIET §4 lever 2 — the beyond-window distill path) emits
+        recall-pointer stubs: result_id + tool + gist + state.db byte location. The full
+        bytes always survive in state.db (archive commit); the stub only relocates them."""
         if not messages:
             return messages, 0
         result = [m.copy() for m in messages]
@@ -3061,7 +3115,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Pass 2: summarize old tool results. Pass 3: shrink large tool_call arguments INSIDE the parsed JSON so
         # the result stays valid; otherwise providers 400 on every turn until the call leaves the window.
         pruned += sum(
-            self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills)
+            self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars, protected_skills, distill_ptrs=distill_ptrs)
             for i in range(max(0, prune_boundary))
         )
         for i in range(max(0, prune_boundary)):
@@ -3186,6 +3240,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             return messages, 0
         pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=None, min_prune_chars=self.proactive_prune_min_result_chars,
+            distill_ptrs=True,
         )
         if not pruned_count:
             # No-op contract: return the INPUT object so callers can gate on `result is not input`.

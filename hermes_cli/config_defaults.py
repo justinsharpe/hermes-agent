@@ -272,6 +272,25 @@ DEFAULT_CONFIG = {
         # timeout_s <= 0 disables; poll_s = sampling interval. Invalid values (NaN, Inf,
         # non-positive poll) warn and fall back to defaults. See agent/turn_liveness.py.
         "turn_liveness": {"timeout_s": 600.0, "poll_s": 15.0},
+        # ROLLING SESSIONS: threshold-triggered session rotation with handoff. When a gateway
+        # session crosses the threshold, hygiene ROTATES it (parent row preserved in state.db —
+        # /resume and session_search still see it — and the fresh session opens with the
+        # compression HANDOFF summary + verbatim tail) instead of compacting in place, so the
+        # per-turn input is handoff + new turns, never a regrown full history. DEFAULT OFF
+        # until the CTX-2 capability battery proves equal-or-better (no-degradation law);
+        # auto-revert by setting enabled: false.
+        #   enabled: master switch (default false)
+        #   threshold: rotation trigger as a fraction of the context window (0.85) or percent
+        #     (85); unset = reuse the gateway hygiene threshold (85%)
+        #   tail_n: verbatim tail messages carried into the fresh session (unset = the
+        #     compressor's protect_last_n, 20)
+        #   keep_verbatim: false = summary-first (the engine still keeps a small tail floor)
+        "session_rolling": {
+            "enabled": False,
+            "threshold": None,
+            "tail_n": None,
+            "keep_verbatim": True,
+        },
     },
 
     "terminal": {
@@ -529,6 +548,13 @@ DEFAULT_CONFIG = {
     # 12-15K tokens). max_lines: max `limit` one read_file call may request before clamping.
     # max_line_length: per-line cap in read_file's line-numbered view (chars).
     "tool_output": {"max_bytes": 50000, "max_lines": 2000, "max_line_length": 2000},
+    # Replay-diet levers (CONTEXT-DIET Stage 1): wire-time trims of REPLAYED history.
+    # tool_calls_max_args_chars: trim oversized historical assistant tool-call argument
+    # echoes on the per-request wire copy (long string leaves inside the parsed JSON,
+    # so the args stay valid; full bytes persist in state.db). Deterministic per stored
+    # row, so the prompt-cache prefix breaks once at the config boundary, not per turn.
+    # 0 = off (byte-identical to pre-feature behaviour).
+    "replay_diet": {"tool_calls_max_args_chars": 0},
     # Tool loop guardrails nudge models that repeat failed/non-progressing tool calls. Soft warnings
     # are always on; hard stops are opt-in so interactive sessions keep flowing.
     "tool_loop_guardrails": {

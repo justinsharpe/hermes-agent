@@ -1214,6 +1214,21 @@ def build_api_messages(
         # wire for every route that does not replay it (OpenRouter/Nous do).
         api_messages.append(api_msg)
 
+    # Replay-diet lever (a) — tool_calls echo trim (CONTEXT-DIET-SPEC-v1 §8 Stage 1):
+    # oversized historical assistant tool-call argument echoes are trimmed on the WIRE
+    # COPY only (persisted rows keep full bytes in state.db; the trim re-derives
+    # deterministically so the prefix stays byte-stable after the config boundary).
+    # Only the replayed prefix (rows before this turn's user message) is eligible;
+    # live rows this turn appended stay byte-exact. 0/off = byte-identical no-op.
+    try:
+        from agent.replay_diet import get_replay_diet_limits, trim_tool_calls_echoes
+
+        _tc_max = get_replay_diet_limits()
+        if _tc_max > 0:
+            trim_tool_calls_echoes(api_messages, _tc_max, history_end_idx=split)
+    except Exception:  # noqa: BLE001 — the diet must never kill the send path
+        logger.debug("replay-diet tool_calls echo trim failed; sending untrimmed", exc_info=True)
+
     # Final system message = cached prompt + ephemeral additions (API-time only).
     # Plugin/recall context goes into the user message, never the system prompt: the
     # prompt is built ONCE per session and replayed verbatim (stable cache prefix).

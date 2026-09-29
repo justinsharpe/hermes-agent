@@ -2172,6 +2172,18 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)
         api_messages.append(api_msg)
 
+    # Replay-diet lever (a) — trim oversized historical tool_calls argument echoes on
+    # the summary wire copy too, so the summary prompt carries the same dieted prefix
+    # as the main loop (else the summary re-prefills the largest context). 0/off = no-op.
+    try:
+        from agent.replay_diet import get_replay_diet_limits, trim_tool_calls_echoes
+
+        _tc_max = get_replay_diet_limits()
+        if _tc_max > 0:
+            trim_tool_calls_echoes(api_messages, _tc_max)
+    except Exception:  # noqa: BLE001
+        logger.debug("replay-diet tool_calls echo trim failed on summary path", exc_info=True)
+
     effective_system = agent._cached_system_prompt or ""
     if agent.ephemeral_system_prompt:
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
