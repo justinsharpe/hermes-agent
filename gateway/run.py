@@ -4146,6 +4146,17 @@ class GatewayRunner(
         base_url: Optional[str]
         api_key: Optional[str]
         data: Any
+        # ROLLING SESSIONS (agent.session_rolling): threshold-triggered rotation with handoff.
+        # When enabled, hygiene rotates the session (parent row preserved, child carries the
+        # compression handoff) instead of compacting in place. Default OFF until the CTX-2
+        # capability battery proves equal-or-better (no-degradation law).
+        session_rolling_enabled: bool = False
+        # None = reuse the hygiene threshold (0.85). Fraction (0.85) or percentage (85).
+        session_rolling_threshold: Optional[float] = None
+        # None = the compressor's own protect_last_n (20). Verbatim tail messages carried over.
+        session_rolling_tail_n: Optional[int] = None
+        # False = summary only (the engine still enforces a small tail floor).
+        session_rolling_keep_verbatim: bool = True
 
     @dataclasses.dataclass
     class _HygieneAttempt:

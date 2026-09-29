@@ -656,6 +656,39 @@ class GatewayTurnMixin:
             "hygiene_failure_cooldown_seconds", hs.failure_cooldown_seconds, float, allow_zero=True,
         )
 
+        # ROLLING SESSIONS (agent.session_rolling): threshold-triggered rotation with handoff.
+        # Default OFF; every knob is optional and fail-soft (invalid values keep the defaults).
+        # enabled=true routes hygiene's compression through the engine's rotation mode
+        # (compression_in_place=False): the parent row stays in state.db (searchable, /resume-able)
+        # and the fresh child session opens with the HANDOFF summary + verbatim tail.
+        _rolling_cfg = data.get("agent", {}) if isinstance(data, dict) else {}
+        if isinstance(_rolling_cfg, dict):
+            _rolling_cfg = _rolling_cfg.get("session_rolling", {})
+        else:
+            _rolling_cfg = {}
+        if isinstance(_rolling_cfg, dict):
+            hs.session_rolling_enabled = str(
+                _rolling_cfg.get("enabled", hs.session_rolling_enabled)
+            ).lower() in {"true", "1", "yes"}
+            _raw_threshold = _rolling_cfg.get("threshold")
+            if _raw_threshold is not None:
+                with suppress(TypeError, ValueError):
+                    _parsed_threshold = float(_raw_threshold)
+                    # Accept 0.85 or 85; reject anything outside (0, 100].
+                    if _parsed_threshold > 1:
+                        _parsed_threshold = _parsed_threshold / 100.0
+                    if 0 < _parsed_threshold <= 1:
+                        hs.session_rolling_threshold = _parsed_threshold
+            _raw_tail = _rolling_cfg.get("tail_n")
+            if _raw_tail is not None:
+                with suppress(TypeError, ValueError):
+                    _parsed_tail = int(_raw_tail)
+                    if _parsed_tail >= 0:
+                        hs.session_rolling_tail_n = _parsed_tail
+            _raw_keep = _rolling_cfg.get("keep_verbatim")
+            if _raw_keep is not None:
+                hs.session_rolling_keep_verbatim = str(_raw_keep).lower() in {"true", "1", "yes"}
+
     async def _hmwa_hygiene_settings(self, source, session_key):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
 
@@ -727,6 +760,11 @@ class GatewayTurnMixin:
             config_context_length=hs.config_context_length, provider=hs.provider or "",
         )
         _compress_token_threshold = int(_hyg_context_length * hs.threshold_pct)
+        # ROLLING SESSIONS: an explicit agent.session_rolling.threshold overrides the trigger
+        # point (same 85% default as hygiene when unset). Rotation itself is the engine's.
+        with suppress(Exception):
+            if hs.session_rolling_enabled and hs.session_rolling_threshold:
+                _compress_token_threshold = int(_hyg_context_length * hs.session_rolling_threshold)
         _warn_token_threshold = int(_hyg_context_length * 0.95)
         _msg_count = len(history)
 
@@ -1276,10 +1314,29 @@ class GatewayTurnMixin:
         try:
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
             # continuation child. Without a SessionDB this stays False.
-            _hyg_agent.compression_in_place = True
+            # ROLLING SESSIONS (agent.session_rolling.enabled): rotate instead — the engine's
+            # compression_in_place=False path ends the parent row (preserved in state.db, so
+            # /resume and session_search still see it) and publishes the child session with the
+            # HANDOFF summary + verbatim tail as its opening turns. The adopt step then rebinds
+            # the live entry, the held turn lease, and the Telegram topic lane to the child,
+            # exactly like the mid-turn compression rotation it already handles. Default OFF
+            # until the capability battery passes (no-degradation law).
+            _hyg_agent.compression_in_place = not hs.session_rolling_enabled
             _bind_hyg_state = getattr(getattr(_hyg_agent, "context_compressor", None), "bind_session_state", None)
             if callable(_bind_hyg_state):
                 _bind_hyg_state(_hyg_session_db, session_entry.session_id)
+            # ROLLING SESSIONS: consumer-side tail knobs — the engine itself is unchanged; this
+            # only configures the detached hygiene compressor instance before the attempt.
+            if hs.session_rolling_enabled:
+                _hyg_compressor = getattr(_hyg_agent, "context_compressor", None)
+                if _hyg_compressor is not None:
+                    if hs.session_rolling_tail_n is not None:
+                        with suppress(Exception):
+                            _hyg_compressor.protect_last_n = hs.session_rolling_tail_n
+                    if not hs.session_rolling_keep_verbatim:
+                        # Summary-first: drop the verbatim tail to the engine's small floor.
+                        with suppress(Exception):
+                            _hyg_compressor.protect_last_n = 0
             # Never finalize on close() — that would end the live gateway session row.
             _hyg_agent._end_session_on_close = False
             _hyg_agent._print_fn = lambda *a, **kw: None
