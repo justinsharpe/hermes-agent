@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -102,7 +102,8 @@ def record_response_usage(
         )
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
-    canonical_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode)
+    canonical_usage = with_served_service_tier(
+        normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
     with suppress(Exception):  # per-run trace (schema v1); capture never breaks a run
         from agent.run_trace import record_provider_usage
 
