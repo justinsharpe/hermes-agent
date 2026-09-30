@@ -449,6 +449,15 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
     here), then the message itself (#111868: a freeze during the first build must leave a
     resumable transcript); the error reply is the only user-visible signal (desktop maps it to a toast)."""
     from hermes_state_user_copy import describe_storage_failure
+    _db_ref = _get_db()  # noqa: F821  module global set by server.py init
+    row_exists_before = False
+    if _db_ref is not None:
+        try:
+            row_exists_before = _db_ref.get_session(session["session_key"]) is not None
+        except Exception:
+            pass
+    logger.debug("prompt.submit persist: sid=%s source=%s row_exists_before=%s",
+                 session["session_key"], _session_source(session), row_exists_before)  # noqa: F821
     try:
         if _ensure_session_db_row(session) is False:
             failure = describe_storage_failure(_db_error)

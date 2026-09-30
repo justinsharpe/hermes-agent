@@ -1986,7 +1986,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @staticmethod
     def _normalize_session_source(value: Any) -> str:
         text = str(value or "").strip().lower()
-        allowed = {"api_server", "hermes_browser", "browser", "cli", "telegram", "discord", "slack", "desktop", "dashboard"}
+        allowed = {"api_server", "hermes_browser", "browser", "cli", "telegram",
+                   "discord", "slack", "desktop", "dashboard", "mobile",
+                   "webchat", "tui"}
         if text not in allowed:
             return "api_server"
         return "hermes_browser" if text == "browser" else text
@@ -2786,7 +2788,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
             "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
-            "display_kind")
+            "display_kind", "display_origin")
         return {key: message.get(key) for key in safe_keys if key in message}
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:

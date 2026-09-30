@@ -2145,6 +2145,19 @@ export interface SessionMessage {
   tool_name?: string;
   tool_call_id?: string;
   timestamp?: number;
+  /**
+   * FC-17 display marker distinguishing a rotation's row classes from fresh
+   * messages, computed by the store from existing columns (no schema change):
+   * - "carried": a tail clone the rotation re-sequenced from an archived
+   *   original (active=1 but display_order < id) — carried forward context,
+   *   not a new arrival. MUST NOT render like a fresh message.
+   * - "archived": a compaction-archived original (active=0, compacted=1) —
+   *   durable display history.
+   * - "rewound": an Undo/Rewind duplicate (audit reads only; display reads
+   *   never return these).
+   * Absent = a fresh live row (older backends/untouched rows degrade cleanly).
+   */
+  display_origin?: "carried" | "archived" | "rewound";
 }
 
 export interface SessionMessagesResponse {

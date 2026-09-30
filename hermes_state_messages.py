@@ -19,6 +19,7 @@ from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
     _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+from hermes_state_common import _SQL_IN_CHUNK
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -910,12 +911,69 @@ class SessionMessagesMixin:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
 
+    def _carried_row_ids(self, rows: List[Any]) -> set:
+        """Row ids among *rows* that are rotation clones by the IDENTITY signature: a
+        lower-id row in the same session shares their ``display_identity`` (an in-place
+        compaction cloned the tail after rewind-flagging the originals, so the clone is
+        unpinned and only the identity sibling betrays it). One indexed query per page;
+        empty for pages with no identities.
+
+        Query shape is load-bearing (TestDisplayDedupe pins paging work as bounded):
+
+        - Each EXISTS branch is pinned by ``INDEXED BY`` to a partial index whose
+          WHERE clause the branch restates EXACTLY. Without the hint SQLite may drive
+          ``earlier`` from ``idx_messages_session_id (session_id=? AND id<?)`` — a scan
+          of the whole session prefix PER candidate row (measured on a 20k-row session:
+          143,699 VM steps for one 120-row page vs 61 with the hints). Two forces push
+          the planner onto that plan: the partial identity indexes exclude rows the
+          other branch's state predicates don't prove, and IN-list candidates hide
+          per-row costs at plan time.
+        - Two branches, not one: a carried clone's earlier identity sibling can be
+          either display-visible (``idx_messages_display_identity``, covering
+          active/compacted rows) or rewind-flagged (``idx_messages_display_identity_rewound``,
+          the in-place tail_count>0 rotation shape where the original keeps
+          active=0/compacted=0 and the clone alone is unpinned).
+        - Ids chunk at 900 per IN-list: SQLite caps bound variables (SQLITE_MAX_VARIABLE_NUMBER).
+        """
+        ids = [r["id"] for r in rows
+               if "id" in r.keys() and "display_identity" in r.keys() and r["display_identity"]]
+        if not ids:
+            return set()
+        carried: set = set()
+        for start in range(0, len(ids), _SQL_IN_CHUNK):
+            chunk = ids[start:start + _SQL_IN_CHUNK]
+            placeholders = _placeholders(chunk)
+            carried.update(row[0] for row in self._read_all(
+                f"""SELECT clone.id FROM messages AS clone
+                    WHERE clone.id IN ({placeholders}) AND (
+                    EXISTS (SELECT 1 FROM messages AS earlier INDEXED BY idx_messages_display_identity
+                            WHERE earlier.session_id = clone.session_id
+                              AND earlier.display_identity = clone.display_identity
+                              AND (earlier.active = 1 OR earlier.compacted = 1)
+                              AND earlier.id < clone.id)
+                    OR EXISTS (SELECT 1 FROM messages AS earlier INDEXED BY idx_messages_display_identity_rewound
+                            WHERE earlier.session_id = clone.session_id
+                              AND earlier.display_identity = clone.display_identity
+                              AND earlier.active = 0 AND earlier.compacted = 0
+                              AND earlier.id < clone.id))""",
+                chunk))
+        return carried
+
     def _row_to_message_dict(self, row, *, warn_context: str, summary_flag: bool) -> Dict[str, Any]:
         """``dict(row)`` with content/tool_calls/display_metadata decoded; *summary_flag* keeps
         ``_compressed_summary`` only as ``True``."""
         msg = dict(row)
+        display_origin = self._display_origin(msg)
+        # FC-17 identity-clone fallback: an unpinned tail clone whose original was
+        # rewind-flagged looks like a fresh row column-wise; only a lower-id sibling
+        # with the same display identity distinguishes it. Resolved per read page.
+        if not display_origin and msg.get("active") and msg.get("display_identity"):
+            if msg["id"] in getattr(self, "_page_carried_ids", ()):
+                display_origin = "carried"
         msg.pop("display_identity", None)
         msg.pop("display_order", None)
+        if display_origin:
+            msg["display_origin"] = display_origin
         if summary_flag and msg.pop("_compressed_summary", 0):
             msg["_compressed_summary"] = True
         msg["content"] = self._decode_content(msg["content"])
@@ -938,6 +996,37 @@ class SessionMessagesMixin:
     def _active_clause(include_inactive: bool, include_compacted: bool) -> str:
         """Audit: every row; display: active plus compaction-archived (never Undo/Rewind rows); default: live."""
         return "" if include_inactive else (_DISPLAY_ACTIVE_CLAUSE if include_compacted else " AND active = 1")
+
+    @staticmethod
+    def _display_origin(msg: Dict[str, Any]) -> Optional[str]:
+        """Display-layer marker distinguishing a rotation's row classes from fresh messages
+        (FC-17: a rotation must never look like old messages re-arriving). Derived from
+        existing columns — no schema or write-path change. The decisive signature is the
+        display slot pin: ``display_order < id`` means the insert/update trigger
+        re-sequenced this row onto an EARLIER row's display slot because its content
+        identity already exists there — a rotation's re-sequenced duplicate. A fresh row
+        always owns its slot (``display_order == id``). The pin survives the row's own
+        lifecycle: a carried clone is ``active=1`` right after the rotation and
+        ``active=0, compacted=1`` once a LATER rotation archives it — both are the
+        "carried" class (verified on the live hot session, 20260929_202138_ef25e91c).
+
+        - ``"carried"``: a re-sequenced duplicate pinned to an earlier display slot
+          (``display_order < id``) — the tail carried into the new context, not a new
+          arrival, whether still live or already archived.
+        - ``"archived"``: a compaction-archived original owning its own slot
+          (``active=0, compacted=1, display_order == id``) — durable display history.
+        - ``"rewound"``: an Undo/Rewind-superseded duplicate (``active=0, compacted=0``);
+          display reads exclude these, audit reads mark them.
+        - absent: a fresh live row the user/model produced — the default, so older clients
+          and untouched rows degrade cleanly.
+        """
+        order, row_id = msg.get("display_order"), msg.get("id")
+        pinned = order is not None and row_id is not None and order < row_id
+        if msg.get("active"):
+            return "carried" if pinned else None
+        if msg.get("compacted"):
+            return "carried" if pinned else "archived"
+        return "rewound"
 
     def get_messages(self, session_id: str, include_inactive: bool = False, include_compacted: bool = False,
                      limit: Optional[int] = None, offset: int = 0, latest: bool = False,
@@ -984,7 +1073,16 @@ class SessionMessagesMixin:
             rows = self._read_all(sql, params)
             if latest:
                 rows.reverse()
-        return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
+        # FC-17: resolve the identity-clone carried set for this page BEFORE decoding
+        # (one query). Only the rotation-aware display read needs it — the default
+        # live read serves the model and must keep its exact prior step budget
+        # (TestDisplayDedupe pins paging work as bounded). Cleared after the page
+        # so a later read can't inherit a stale carried set.
+        self._page_carried_ids = self._carried_row_ids(rows) if include_compacted else set()
+        try:
+            return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
+        finally:
+            self._page_carried_ids = set()
 
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results containing ``/pull/``: a deliberately loose scan, oldest-first so the caller takes the last."""

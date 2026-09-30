@@ -1423,9 +1423,16 @@ def _resolve_session_platform() -> str:
 
 
 def _resolve_session_source(explicit: str | None) -> str:
-    """Session DB ``source``: an explicit caller value (plugin session tagged ``"telegram"``) is never
-    rewritten; only empty/None falls back to the env-resolved platform."""
-    return explicit or _resolve_session_platform()
+    if explicit:
+        return explicit
+    # Caller did not name an origin: prefer "desktop" (the only live
+    # controller on a headless Hermes serve), else "tui" for embedded terminals.
+    # HERMES_DESKTOP=1 without HERMES_DESKTOP_TERMINAL → desktop
+    # HERMES_DESKTOP=1 WITH HERMES_DESKTOP_TERMINAL → tui (embedded terminal pane)
+    # HERMES_DESKTOP unset → desktop (headless serve has no TTY)
+    if is_truthy_value(os.environ.get("HERMES_DESKTOP")):
+        return "tui" if is_truthy_value(os.environ.get("HERMES_DESKTOP_TERMINAL")) else "desktop"
+    return "desktop"
 
 
 def _resolve_agent_platform(source: str | None) -> str:

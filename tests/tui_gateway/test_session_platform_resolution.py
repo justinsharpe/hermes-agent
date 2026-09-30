@@ -77,9 +77,11 @@ class TestResolveSessionSource:
         assert _srv._resolve_session_source("telegram") == "telegram"
 
 
-    def test_no_env_no_param_defaults_to_tui(self, clean_env):
+    def test_no_hermes_desktop_defaults_to_desktop(self, clean_env):
         _srv = _reload_resolver()
-        assert _srv._resolve_session_source(None) == "tui"
+        # When HERMES_DESKTOP is unset on a headless Hermes serve, the layered default
+        # resolves to "desktop" (the only live controller on a headless serve).
+        assert _srv._resolve_session_source(None) == "desktop"
 
 
 class TestResolveAgentPlatform:

@@ -640,6 +640,17 @@ export interface SessionMessage {
    * so readers must narrow before indexing into it.
    */
   display_metadata?: string | TimelineDisplayMetadata
+  /**
+   * FC-17 rotation marker (store-computed, no schema change):
+   * - 'carried': a tail clone re-sequenced from an archived original
+   *   (active=1, display_order < id) — carried context, not a new arrival;
+   *   must never render like a fresh message.
+   * - 'archived': a compaction-archived original (active=0, compacted=1) —
+   *   durable display history.
+   * - 'rewound': an Undo/Rewind duplicate (audit reads only).
+   * Absent = fresh live row (older backends degrade cleanly).
+   */
+  display_origin?: 'carried' | 'archived' | 'rewound'
   role: 'assistant' | 'system' | 'tool' | 'user'
   /**
    * Durable `messages.id` from the backend. The renderer's own message ids are

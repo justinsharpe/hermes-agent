@@ -382,6 +382,20 @@ function MessageBubble({
       ? `${t.sessions.roles.tool}: ${msg.tool_name}`
       : style.label;
 
+  // FC-17: carried rows are tail clones the rotation re-sequenced from
+  // archived originals, and archived rows are the originals themselves.
+  // Without a visible marker a context rotation reads as yesterday's
+  // messages re-arriving as fresh ones. Dim the row and badge it so a
+  // rotation can never look like a new message arrival. (Absent
+  // display_origin = fresh live row; older backends degrade cleanly.)
+  const originLabel =
+    msg.display_origin === "carried"
+      ? "carried from earlier context"
+      : msg.display_origin === "archived"
+        ? "archived"
+        : null;
+  const isNonFresh = originLabel !== null;
+
   // Check if any search term appears as a prefix of any word in content
   const isHit = (() => {
     if (!highlight || !msg.content) return false;
@@ -396,11 +410,19 @@ function MessageBubble({
 
   return (
     <div
-      className={`${style.bg} p-3 ${isHit ? "ring-1 ring-warning/40" : ""}`}
+      className={`${style.bg} p-3 ${isHit ? "ring-1 ring-warning/40" : ""} ${
+        isNonFresh ? "opacity-60" : ""
+      }`}
       data-search-hit={isHit || undefined}
+      data-display-origin={msg.display_origin || undefined}
     >
       <div className="flex items-center gap-2 mb-1">
         <span className={`text-xs font-semibold ${style.text}`}>{label}</span>
+        {isNonFresh && (
+          <Badge tone="secondary" className="text-xs py-0 px-1.5">
+            {originLabel}
+          </Badge>
+        )}
         {isHit && (
           <Badge tone="warning" className="text-xs py-0 px-1.5">
             {t.common.match}
