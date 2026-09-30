@@ -305,6 +305,43 @@ class ConfigPlumbing(unittest.TestCase):
         self.assertIn("prompt_diet", agent)
         self.assertEqual(agent["prompt_diet"], {})
 
+    def test_prompt_diet_binds_from_agent_section(self):
+        """Config->flags integration (regression: top-level read never bound live config).
+
+        DEFAULT_CONFIG documents prompt_diet under the ``agent`` section and config.yaml
+        arms it there; _apply_agent_section must read it from ``_agent_section`` (the
+        ``agent`` mapping), not from the config top level. Live cutover receipt
+        2026-09-30: top-level read bound all four flags False on the armed live config.
+        """
+        from agent.agent_init import _apply_agent_section
+
+        class _A:
+            run_budget_seconds = None
+
+        diet = {"soul_hot_compile": True, "skills_category_map": True,
+                "memory_block_max_chars": 1400, "user_block_max_chars": 1200}
+        # Arming shape that matches config.yaml: prompt_diet nested under "agent".
+        cfg = {"agent": {"prompt_diet": diet}}
+        a1 = _A()
+        _apply_agent_section(a1, cfg)
+        self.assertTrue(a1._prompt_diet_soul_hot_compile)
+        self.assertTrue(a1._prompt_diet_skills_category_map)
+        self.assertEqual(a1._prompt_diet_memory_block_max_chars, 1400)
+        self.assertEqual(a1._prompt_diet_user_block_max_chars, 1200)
+
+        # A top-level prompt_diet must NOT bind (it is not a documented location).
+        cfg2 = {"prompt_diet": dict(diet)}
+        a2 = _A()
+        _apply_agent_section(a2, cfg2)
+        self.assertFalse(a2._prompt_diet_soul_hot_compile)
+        self.assertFalse(a2._prompt_diet_skills_category_map)
+        self.assertEqual(a2._prompt_diet_memory_block_max_chars, 0)
+
+        # Malformed section -> flags off, no raise.
+        a3 = _A()
+        _apply_agent_section(a3, {"agent": {"prompt_diet": "not-a-dict"}})
+        self.assertFalse(a3._prompt_diet_soul_hot_compile)
+
     def test_cache_busting_keys_registered(self):
         import re
         src = Path("gateway/run.py").read_text()

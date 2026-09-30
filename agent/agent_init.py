@@ -1385,7 +1385,9 @@ def _apply_agent_section(agent, _agent_cfg):
 
     # CONTEXT-DIET §3 (Stage-2 static diet, CTX-3-ruled constants): compile-once prompt
     # diet gates. All default OFF — an unset section is byte-identical to pre-feature.
-    _diet = _cfg_dict(_agent_cfg, "prompt_diet")
+    # (Read from the ``agent`` section, where DEFAULT_CONFIG documents it and
+    # config.yaml arms it — NOT from the config top level.)
+    _diet = _cfg_dict(_agent_section, "prompt_diet")
     agent._prompt_diet_soul_hot_compile = bool(_diet.get("soul_hot_compile", False))
     agent._prompt_diet_skills_category_map = bool(_diet.get("skills_category_map", False))
     agent._prompt_diet_memory_block_max_chars = _parse_config_int(_diet.get("memory_block_max_chars", 0), 0)
