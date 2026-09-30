@@ -956,7 +956,12 @@ class TurnRunner:
         # mobile inbox groups (partner threads) want final-answer-first, DMs keep live streaming.
         # enabled_for composes: a per-platform/per-chat value can only narrow the global switch.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming", chat_id=ctx.source.chat_id)
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        # Explicit override wins (local #8e05a066d4): a chat/platform value is operator intent,
+        # so it opens the gate on its own; with no override, upstream's enabled_for applies
+        # (global master switch = narrow-only policy).
+        want_stream_deltas = not ctx.scheduled_heartbeat and (
+            scfg.enabled_for(plat_streaming) if plat_streaming is None else bool(plat_streaming)
+        )
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:

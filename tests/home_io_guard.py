@@ -86,6 +86,14 @@ class HomeIOGuard:
             # probe) reads no state; only its contents are guarded.
             if metadata and absolute in roots:
                 return
+            # Import-time PM activation (hermes_bootstrap -> pm.environments.payload_venv)
+            # stats <home>/manifest.json from any checkout installed inside the home — the
+            # DEFAULT install (install.sh: INSTALL_DIR=$HERMES_HOME/hermes-agent). An
+            # existence probe of the payload manifest is layout discovery, not state: the
+            # installer writes it and it never carries conversation/memory data. Refusing it
+            # aborts the import chain and fails every dependent test on a default install.
+            if metadata and any(absolute == os.path.join(r, "manifest.json") for r in roots):
+                return
             # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
             # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
             # command lookup, not reading Hermes state. CI has no such entries.

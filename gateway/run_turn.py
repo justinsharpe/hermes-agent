@@ -2781,12 +2781,16 @@ class GatewayTurnMixin:
         if _scfg is None:
             from gateway.config import StreamingConfig
             _scfg = StreamingConfig()
-        # Global master switch first: skips the config.yaml re-read on the default (off) path.
-        if not _scfg.globally_enabled:
-            return None
         from gateway.display_config import resolve_display_setting
         _plat_streaming = resolve_display_setting(_load_gateway_config(), _platform_config_key(source.platform), "streaming", chat_id=source.chat_id)
-        if not _scfg.enabled_for(_plat_streaming):
+        # Explicit override wins (local #8e05a066d4): a chat/platform value is operator
+        # intent, so it opens the gate on its own; with no override, upstream's enabled_for
+        # applies (global master switch = narrow-only policy). The resolve runs BEFORE the
+        # gate, so an explicit override survives a globally-off master switch.
+        if _plat_streaming is None:
+            if not _scfg.enabled_for(_plat_streaming):
+                return None
+        elif not bool(_plat_streaming):
             return None
         try:
             from gateway.stream_consumer import GatewayStreamConsumer
