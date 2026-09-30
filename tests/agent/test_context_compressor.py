@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock
 from agent.context_compressor import (
     ContextCompressor,
     HISTORICAL_TASK_HEADING,
+    OPEN_TAIL_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
     _COMPRESSION_MARKER_PREFIX,
@@ -759,7 +760,11 @@ class TestNonStringContent:
 
         assert summary.startswith(f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n")
         assert "do something" in summary
-        assert summary.endswith("plain summary text")
+        # OPEN-tail law (R14 §2 law 4, CONTEXT-DIET §4 lever 3): every summary carries an
+        # explicit OPEN section — "ok" did not answer "do something", so the obligation
+        # rides the tail instead of vanishing into the compressed middle.
+        assert "plain summary text" in summary
+        assert OPEN_TAIL_HEADING in summary
 
 
 

@@ -873,6 +873,108 @@ _LEAN_RECOVERY_HEADING = "## Context Recovery"
 _LEAN_TAIL_KEEP_TOOL_ROUNDS = 6
 _LEAN_TAIL_DEMOTE_MIN_CHARS = 1_500
 
+# OPEN tail (R14 §2 law 4 — SESSION-CONTINUITY-SPEC): every compaction summary MUST carry an
+# explicit "## OPEN" tail listing what was promised/started and NOT finished. Obligations may
+# never vanish into the compressed middle (the 9/1 + 9/4 failure record); the undo ledger
+# outside the window remains the authority either way. CONTEXT-DIET §4 lever 3 makes this
+# non-negotiable for rolling summaries, so it is enforced deterministically: the LLM template
+# asks for the section AND a post-hoc check appends a mechanically-extracted one when missing.
+OPEN_TAIL_HEADING = "## OPEN"
+_OPEN_TAIL_PLACEHOLDER = "None. No unfulfilled promises or unfinished work in the compacted turns."
+_OPEN_TAIL_MAX_ITEMS = 12
+_OPEN_ITEM_MAX_CHARS = 240
+# Promise markers in assistant prose that indicate an open loop (kept conservative: these
+# fire on explicit commitment language, not on hedging).
+_OPEN_PROMISE_MARKERS = (
+    "i will", "i'll", "next step", "next: ", "then i", "will follow up", "will ship",
+    "will build", "will run", "will test", "will add", "will fix", "will verify",
+    "will report", "will land", "remaining:", "todo:", "left to do", "still need",
+    "still pending", "not yet done", "isn't done", "hasn't been done",
+)
+
+
+def _extract_open_loops(turns: List[Dict[str, Any]]) -> List[str]:
+    """Mechanically extract open loops from compacted turns (deterministic, no LLM).
+
+    Sources, in trust order: (1) the last real user message's unfulfilled request when a
+    later assistant turn never answered it; (2) assistant commitment lines (promise
+    markers); (3) TODO tool rows not marked completed. Redacted like every other
+    compaction surface. Deduped, newest-first, capped.
+    """
+    open_items: list[str] = []
+
+    def _add(text: str) -> None:
+        text = _redact_compaction_text(str(text).strip())
+        if not text:
+            return
+        if len(text) > _OPEN_ITEM_MAX_CHARS:
+            text = text[: _OPEN_ITEM_MAX_CHARS - 3].rstrip() + "..."
+        if not any(text[:80] == item[:80] for item in open_items):  # cheap head-dedupe
+            open_items.append(text)
+
+    last_user_text = ""
+    answered = False
+    for msg in turns:
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if role == "user" and not _synthetic_user_row(content):
+            last_user_text, answered = content.strip(), False
+        elif role == "assistant" and content.strip():
+            if last_user_text:
+                # A substantive reply answers the pending user turn.
+                if len(content.strip()) >= 40 or any(
+                    tc for tc in (msg.get("tool_calls") or []) if _tc_get(tc, "id")
+                ):
+                    answered = True
+            lowered = content.casefold()
+            for marker in _OPEN_PROMISE_MARKERS:
+                idx = lowered.find(marker)
+                if idx >= 0:
+                    # Take the sentence containing the marker.
+                    start = content.rfind(".", 0, idx) + 1
+                    end = content.find(".", idx)
+                    _add(content[start: end + 1 if end > 0 else len(content)].strip())
+                    break
+    if last_user_text and not answered:
+        _add(f"User's latest request unanswered in compacted turns: {last_user_text}")
+    return open_items[:_OPEN_TAIL_MAX_ITEMS]
+
+
+def _render_open_tail(items: List[str]) -> str:
+    """The '## OPEN' section body (heading excluded) from mechanical items."""
+    if not items:
+        return _OPEN_TAIL_PLACEHOLDER
+    return "\n".join(f"- {item}" for item in items)
+
+
+def _ensure_open_tail(summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
+    """Enforce the OPEN-tail law on a finished summary (no-op when the LLM complied).
+
+    If the summary already contains a non-placeholder '## OPEN' section, keep it byte-stable
+    (prompt-cache respect). Otherwise append the deterministic section. Applied BEFORE
+    ``_with_summary_prefix`` normalization so the heading survives intact.
+    """
+    if OPEN_TAIL_HEADING in summary:
+        # Non-placeholder content under the heading = LLM complied; keep as written.
+        idx = summary.find(OPEN_TAIL_HEADING)
+        after = summary[idx + len(OPEN_TAIL_HEADING):].lstrip()
+        if after and not after.startswith("None"):
+            return summary
+        # Placeholder only: replace with the mechanical extraction.
+        items = _extract_open_loops(turns_to_summarize)
+        head = summary[:idx].rstrip()
+        if not items:
+            return head + "\n\n" + OPEN_TAIL_HEADING + "\n" + _OPEN_TAIL_PLACEHOLDER
+        return head + "\n\n" + OPEN_TAIL_HEADING + "\n" + _render_open_tail(items)
+    items = _extract_open_loops(turns_to_summarize)
+    if not items:
+        # No open loops found AND no section: law still requires the explicit tail —
+        # a reader must be able to distinguish "nothing open" from "nobody checked".
+        return summary.rstrip() + "\n\n" + OPEN_TAIL_HEADING + "\n" + _OPEN_TAIL_PLACEHOLDER
+    return summary.rstrip() + "\n\n" + OPEN_TAIL_HEADING + "\n" + _render_open_tail(items)
+
 
 def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> str:
     """One-line replacement for a demoted tail tool result."""
@@ -2105,6 +2207,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(self.context_length * 0.025)))
             else:
                 budget = int(self.threshold_tokens * self.summary_target_ratio)
+            # CONTEXT-DIET §2 (CTX-3 ruling, 2026-09-30): optional BINDING window token
+            # budget — the last <=protect_last_n messages AND <=window_token_budget tok,
+            # whichever binds first. This is the lever that caps sub-8k tool-result mass
+            # inside the message-count window (98.7% of live-lane transcript chars are
+            # tool bytes). 0/unset = mode-default budget (byte-identical to pre-feature).
+            _binding = self._window_budget_binding_tokens()
+            if _binding is not None:
+                budget = min(budget, _binding)
             if self.context_length > 0:
                 budget = min(budget, int(self.context_length * TAIL_MAX_CONTEXT_FRACTION))
             self._tail_token_budget = max(1, budget)
@@ -2118,6 +2228,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     def max_summary_tokens(self) -> int:
         if self._max_summary_tokens is None:
             self._max_summary_tokens = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+            # CONTEXT-DIET §2 (CTX-3 ruling): ruled cap 2k tok per summary cadence
+            # (derived: target_ratio 0.15 x 12k window = 1.8k typical). Config binding wins.
+            _cfg_cap = getattr(self, "max_summary_tokens_cfg", 0) or 0
+            if _cfg_cap > 0:
+                self._max_summary_tokens = min(self._max_summary_tokens, _cfg_cap)
         return self._max_summary_tokens
 
     @max_summary_tokens.setter
@@ -2512,7 +2627,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
         self._tail_token_budget = None
         _ = self.tail_token_budget  # eager recompute, same timing as before
+        # CONTEXT-DIET §2: keep the config summary cap binding after a model switch.
         self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        _cfg_summary_cap = int(getattr(self, "max_summary_tokens_cfg", 0) or 0)
+        if _cfg_summary_cap > 0:
+            self.max_summary_tokens = min(self.max_summary_tokens, _cfg_summary_cap)
         # Old usage cannot price a new model. Clear it without arming the post-compaction
         # latch: the next response supplies usage or enables the usage-less fallback.
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
@@ -2620,7 +2739,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, window_token_budget: int = 0, max_summary_tokens_cfg: int = 0,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -2654,6 +2773,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._last_reclaim_block_warn: "tuple[str, int] | None" = None
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        # CONTEXT-DIET §2/§4 (CTX-3 ruling, 2026-09-30) — Stage-2 history-side levers.
+        # window_token_budget: BINDING cap on the protected tail's token budget (0 = off,
+        # mode-default). max_summary_tokens_cfg: BINDING cap on the per-compaction
+        # summary budget (0 = off, window-derived). Both are config-fed and profile-scoped.
+        self.window_token_budget = max(0, int(window_token_budget or 0))
+        self.max_summary_tokens_cfg = max(0, int(max_summary_tokens_cfg or 0))
         self.quiet_mode = quiet_mode
         # Usable input = context_length - max_tokens; only a positive int counts as a reservation.
         self.max_tokens = self._coerce_max_tokens(max_tokens)
@@ -2958,6 +3083,16 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Apply the floor in count-space: `max` in index-space would invert (smaller index = MORE protected).
         return min(boundary, len(result) - min_protect)
 
+    def _window_budget_binding_tokens(self) -> "int | None":
+        """The BINDING window token budget from config, or None when off (CONTEXT-DIET §2).
+
+        The protected tail keeps the last ``<=protect_last_n`` messages AND fits
+        ``<=window_token_budget`` tokens — whichever binds first. ``0``/unset keeps the
+        mode-default budget (byte-identical to pre-feature behaviour).
+        """
+        _binding = int(getattr(self, "window_token_budget", 0) or 0)
+        return _binding if _binding > 0 else None
+
     @staticmethod
     def _dedupe_tool_results(result: List[Dict[str, Any]]) -> int:
         """Pass 1: keep the newest copy of identical tool results, back-reference older ones."""
@@ -3036,6 +3171,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         """Optional tail rows may overrun the budget by 1.5x so whole rows are kept, but never past
         ``TAIL_MAX_CONTEXT_FRACTION`` of the window — on a small window the overrun alone was a third
         of the request. Required anchors and atomic tool groups may still exceed it."""
+        # CONTEXT-DIET §2 binding mode: no overrun allowed — the window budget is a hard
+        # limit (last <=protect_last_n msgs AND <=budget tok, whichever binds first).
+        # Required anchors and atomic tool groups keep their existing exceed-rights.
+        if self._window_budget_binding_tokens() is not None:
+            return max(token_budget, 1)
         ceiling = int(token_budget * 1.5)
         ctx = getattr(self, "context_length", 0) or 0
         if ctx > 0:
@@ -3432,6 +3572,9 @@ None recoverable from deterministic fallback.
 ## Resolved Questions
 None recoverable from deterministic fallback.
 
+{OPEN_TAIL_HEADING}
+{_render_open_tail(_extract_open_loops(turns_to_summarize))}
+
 ## Relevant Files
 {_bullets(anchors["relevant_files"], limit=12)}
 
@@ -3700,6 +3843,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # See #32106.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
+            # OPEN-tail law (R14 §2 law 4, enforced deterministically post-hoc): keep the
+            # LLM's section when present; append the mechanical extraction when missing.
+            summary = _ensure_open_tail(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
             # A detached stale attempt must not publish its late summary onto shared compressor state:
@@ -3836,6 +3982,12 @@ the user's correction and record what changed as a result.]
 
 ## Resolved Questions
 {_section["resolved_questions"]}
+
+{OPEN_TAIL_HEADING}
+[MANDATORY SECTION (R14 §2 law 4) — what was promised, started, or asked and NOT yet finished in
+these compacted turns: open obligations, unanswered questions, unfinished work. Every item the
+user or the work still owes must be listed here; write "None." ONLY when genuinely nothing
+remains open. Never let an obligation vanish into the compressed middle.]
 
 ## Relevant Files
 [Files read, modified, or created — with brief note on each]

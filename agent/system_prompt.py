@@ -299,7 +299,10 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
 
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
-    categories to names-only — never hidden, every name stays visible."""
+    categories to names-only — never hidden, every name stays visible.
+    CONTEXT-DIET §3 lever 2: ``prompt_diet.skills_category_map`` compiles the index to a
+    counts-only category map (~1.6k chars vs 28k full index). Recall path unchanged:
+    ``skills_list`` returns the full name+description index on demand."""
     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
     import model_tools
@@ -310,7 +313,8 @@ def _skills_prompt(agent: Any) -> str:
     except Exception:
         _compact_cats = frozenset()
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         category_map_only=bool(getattr(agent, "_prompt_diet_skills_category_map", False)))
 
 
 def _auto_load_parts(agent: Any) -> List[str]:
@@ -511,16 +515,62 @@ def _timestamp_line(agent: Any) -> str:
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
+def _cap_memory_block_projection(agent: Any, block: str, kind: str, max_chars: int) -> str:
+    """Cap a memory/user block's PROMPT projection to ``max_chars`` chars (CONTEXT-DIET §3).
+
+    The block shape is: ``══…`` / ``<title> [usage]`` / ``══…`` / entries joined by ``§``.
+    Keep the header (title + usage line — the model uses it to judge store state), then
+    keep entries newest-first until the cap, and append a recall pointer for the rest.
+    The store on disk is never touched.
+    """
+    from tools.memory_tool_store import ENTRY_DELIMITER
+    if not block or max_chars <= 0 or len(block) <= max_chars:
+        return block
+    lines = block.splitlines()
+    # Header = up to 3 leading lines (sep, title[usage], sep).
+    header_lines = lines[:3] if len(lines) > 3 and lines[0].startswith("═") else lines[:1]
+    header = "\n".join(header_lines)
+    body = "\n".join(lines[len(header_lines):]).strip()
+    entries = [e for e in (x.strip() for x in body.split(ENTRY_DELIMITER)) if e]
+    kept: list[str] = []
+    used = len(header)
+    dropped = 0
+    # Entries are stored oldest-first; the highest-signal facts are the most recent,
+    # so keep from the END (newest) and drop from the front (oldest).
+    for entry in reversed(entries):
+        cost = len(entry) + len(ENTRY_DELIMITER)
+        if used + cost > max_chars - 120:  # reserve the recall-pointer tail
+            break
+        kept.append(entry)
+        used += cost
+    kept.reverse()
+    dropped = len(entries) - len(kept)
+    recall = (
+        f"\n{ENTRY_DELIMITER}[{dropped} older {kind} entries compiled out of this prompt — "
+        "recall with the memory tool or session_search; the store itself is untouched.]"
+    )
+    return header + "\n" + ENTRY_DELIMITER.join(kept) + recall
+
+
 def _memory_parts(agent: Any) -> List[str]:
     """Built-in memory/USER.md blocks plus the external provider block (gated on
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
-    tools the toolset config gated off)."""
+    tools the toolset config gated off).
+    CONTEXT-DIET §3 lever 3: ``prompt_diet.memory_block_max_chars`` /
+    ``user_block_max_chars`` cap the PROMPT PROJECTION only (top entries kept,
+    newest-first; the store itself is untouched — depth moves to the memory tool,
+    session_search, mnemosyne recall)."""
     parts: List[str] = []
     if agent._memory_store:
         for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
             block = agent._memory_store.format_for_system_prompt(kind) if enabled else None
             if block:
-                parts.append(block)
+                _cap = (getattr(agent, "_prompt_diet_memory_block_max_chars", 0)
+                        if kind == "memory" else getattr(agent, "_prompt_diet_user_block_max_chars", 0))
+                if _cap and _cap > 0:
+                    block = _cap_memory_block_projection(agent, block, kind, int(_cap))
+                if block:
+                    parts.append(block)
     # External memory provider system prompt block (additive to built-in). Gated on the same check
     # ``inject_memory_provider_tools`` uses so we never advertise provider tools that the agent's toolset
     # configuration has already gated off (#81014).
@@ -545,6 +595,8 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
     Returns ``(parts, soul_loaded)``."""
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
+    if _soul_content and getattr(agent, "_prompt_diet_soul_hot_compile", False):
+        _soul_content = _pb.hot_compile_soul_md(_soul_content, home_override=_agent_home(agent))
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 

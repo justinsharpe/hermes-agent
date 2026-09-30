@@ -176,6 +176,15 @@ DEFAULT_CONFIG = {
         # wrapping Hermes (sandbox runner, managed platform) can describe proxy/credential/ mount
         # layout without editing SOUL.md. Env HERMES_ENVIRONMENT_HINT overrides it.
         "environment_hint": "",
+        # CONTEXT-DIET §3 (Stage-2 static diet; CTX-3 ruling 2026-09-30). Compile-once prompt
+        # diet levers, all OFF by default (unset = byte-identical to pre-feature):
+        #   soul_hot_compile: SOUL.md -> identity lens + top laws; lore/duties become a
+        #       named cold payload (read_file on demand). Store/faith untouched.
+        #   skills_category_map: the per-skill <available_skills> index compiles to a
+        #       counts-only category map; skills_list/skill_view remain the recall path.
+        #   memory_block_max_chars / user_block_max_chars: cap the memory/user PROMPT
+        #       projection (0 = off; store untouched — depth moves to recall).
+        "prompt_diet": {},
         # Coding posture: on interactive coding surfaces (CLI, TUI, desktop, ACP) in a code
         # workspace, add a coding brief + live git/workspace snapshot to the system prompt
         # (agent/coding_context.py). "auto" = prompt-only when interactive AND cwd is a code
@@ -660,6 +669,15 @@ DEFAULT_CONFIG = {
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,
+        # CONTEXT-DIET §2/§4 (CTX-3 ruling 2026-09-30) — Stage-2 history-side levers:
+        # window_token_budget: BINDING token cap on the protected window — the last
+        # <=protect_last_n messages AND <=window_token_budget tokens, whichever binds
+        # first. This is the lever that caps sub-8k tool-result mass inside the
+        # message-count window. 0 = off (mode-default budget).
+        "window_token_budget": 0,
+        # max_summary_tokens: BINDING cap on each compaction summary's token budget
+        # (ruled 2k: 0.15 x 12k window = 1.8k typical). 0 = off (window-derived).
+        "max_summary_tokens": 0,
         # When True, auto-compression whose summary fails (aux error / non-JSON / timeout) aborts
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.

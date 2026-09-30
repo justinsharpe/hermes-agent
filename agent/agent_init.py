@@ -1383,6 +1383,14 @@ def _apply_agent_section(agent, _agent_cfg):
     # platform_hints: <platform>: {append|replace}, stored verbatim (agent/system_prompt.py).
     agent._platform_hint_overrides = _cfg_dict(_agent_cfg, "platform_hints")
 
+    # CONTEXT-DIET §3 (Stage-2 static diet, CTX-3-ruled constants): compile-once prompt
+    # diet gates. All default OFF — an unset section is byte-identical to pre-feature.
+    _diet = _cfg_dict(_agent_cfg, "prompt_diet")
+    agent._prompt_diet_soul_hot_compile = bool(_diet.get("soul_hot_compile", False))
+    agent._prompt_diet_skills_category_map = bool(_diet.get("skills_category_map", False))
+    agent._prompt_diet_memory_block_max_chars = _parse_config_int(_diet.get("memory_block_max_chars", 0), 0)
+    agent._prompt_diet_user_block_max_chars = _parse_config_int(_diet.get("user_block_max_chars", 0), 0)
+
     # App-level API retry count (wraps each model API call). Default 3; 1 = single attempt.
     try:
         _api_retries = max(int(_agent_section.get("api_max_retries", 3)), 1)
@@ -1536,6 +1544,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         micro_compact_defrag_tokens=max(
             1, _parse_config_int(cfg.get("micro_compact_defrag_threshold_tokens", 2000), 2000)
         ),
+        # CONTEXT-DIET §2/§4 (CTX-3 ruling, 2026-09-30) — Stage-2 history-side levers.
+        # window_token_budget: BINDING token cap on the protected window (0 = mode default).
+        # max_summary_tokens: BINDING cap on each compaction summary (0 = window-derived).
+        window_token_budget=max(0, _parse_config_int(cfg.get("window_token_budget", 0), 0)),
+        max_summary_tokens=max(0, _parse_config_int(cfg.get("max_summary_tokens", 0), 0)),
         codex_app_server_auto=app_server_auto,
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
@@ -1954,6 +1967,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
+            window_token_budget=getattr(cs, "window_token_budget", 0),
+            max_summary_tokens_cfg=getattr(cs, "max_summary_tokens", 0),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

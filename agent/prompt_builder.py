@@ -1252,6 +1252,7 @@ def _current_session_platform_hint() -> str:
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
+    category_map_only: bool = False,
 ) -> str:
     """Compact skill index for the system prompt.
 
@@ -1259,6 +1260,8 @@ def build_skills_system_prompt(
     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
+    ``category_map_only`` (CONTEXT-DIET §3 lever 2): counts-only category map instead of the
+    full per-skill index. Recall: ``skills_list`` on demand returns name+description for every skill.
     """
     _home_token = None
     if skills_dir_override is not None:
@@ -1274,7 +1277,8 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
         return _build_skills_system_prompt_inner(
-            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+            skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs,
+            category_map_only=category_map_only)
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1336,10 +1340,33 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    category_map_only: bool = False,
 ) -> str:
-    """Render the ## Skills block; "" when there is nothing to list."""
+    """Render the ## Skills block; "" when there is nothing to list.
+
+    ``category_map_only`` (CONTEXT-DIET §3 lever 2): counts-only category map —
+    "category: N skill(s)" per line, zero per-skill descriptions or names. Every
+    skill stays fully discoverable via skills_list (full index on demand) and
+    skill_view(name)."""
     if not skills_by_category:
         return ""
+    if category_map_only:
+        map_lines = [
+            f"  {category}: {len({n for n, _ in entries})} skill(s)"
+            for category, entries in sorted(skills_by_category.items())
+        ]
+        total = sum(len({n for n, _ in entries}) for entries in skills_by_category.values())
+        return (
+            "## Skills\n"
+            "Skills exist in the categories below. You do NOT see names or descriptions here —\n"
+            "the index is compiled to a category map to save context. To discover skills, call\n"
+            "skills_list(category=<name> or omit) — it returns every skill name with its description —\n"
+            "then load a matching skill with skill_view(name). Err on the side of checking\n"
+            "skills_list for the task's category before proceeding without a skill.\n"
+            "\n"
+            "<available_skills>\n" + "\n".join(map_lines) + f"\n</available_skills>\n"
+            f"({total} skills total across {len(skills_by_category)} categories; skills_list reveals them.)"
+        )
     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
     demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
@@ -1401,7 +1428,7 @@ def _oneshot_prompt_variant() -> bool:
 def _build_skills_system_prompt_inner(
     skills_dir: "Path", external_dirs: "list[Path]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
-    project_dirs: "list[Path] | None" = None,
+    project_dirs: "list[Path] | None" = None, category_map_only: bool = False,
 ) -> str:
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
@@ -1412,7 +1439,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(),
+        _oneshot_prompt_variant(), bool(category_map_only),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1470,7 +1497,8 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools,
+                                  category_map_only=category_map_only)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
@@ -1556,6 +1584,72 @@ def load_soul_md(context_length: Optional[int] = None, home_override: "Path | No
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
         return None
+
+
+def hot_compile_soul_md(content: str, home_override: "Path | None" = None) -> str:
+    """CONTEXT-DIET §3 lever 1: compile SOUL.md to the identity lens + top laws (~1.5k tok).
+
+    Generic hot-compile: keeps (a) any YAML frontmatter, (b) everything up to and
+    including the first ``##`` section (identity lens), (c) any ``##`` section whose
+    heading matches a hot pattern (identity, honesty/top-law, voice, lines-you-hold,
+    vernacular — the operational core), and (d) a cold-payload index naming the dropped
+    sections with their read-back path. Everything else (lore, origin, duties prose,
+    squad detail) becomes payload-by-path: the model reads it when it actually needs it.
+    """
+    if not content or not content.strip():
+        return content
+    _hot_patterns = (
+        "identity", "honesty", "top law", "top-law", "voice", "register",
+        "lines you hold", "vernacular", "mission", "boundaries", "core principles",
+    )
+    lines = content.splitlines()
+    # Frontmatter (--- ... ---) survives whole.
+    fm_end = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                fm_end = i + 1
+                break
+    head = lines[:fm_end]
+    body = lines[fm_end:]
+    # Intro prose up to the first '##' heading is the identity lens — keep whole.
+    first_h2 = next((i for i, ln in enumerate(body) if ln.startswith("## ")), len(body))
+    kept_intro = body[:first_h2]
+    sections: list[tuple[str, list[str]]] = []  # (heading, body_lines)
+    current_heading: str = ""
+    current: list[str] = []
+    for ln in body[first_h2:]:
+        if ln.startswith("## "):
+            if current_heading or current:
+                sections.append((current_heading, current))
+            current_heading, current = ln.strip(), []
+        else:
+            current.append(ln)
+    if current_heading or current:
+        sections.append((current_heading, current))
+    hot: list[str] = []
+    cold_names: list[str] = []
+    for heading, section_lines in sections:
+        heading_l = heading.casefold()
+        if any(p in heading_l for p in _hot_patterns):
+            hot.append(heading + "\n" + "\n".join(section_lines).rstrip())
+        else:
+            cold_names.append(heading.lstrip("# ").strip())
+    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
+    cold_index = ""
+    if cold_names:
+        cold_index = (
+            "\n\n## Cold Identity Payloads (read on demand)\n"
+            f"Full SOUL.md lives at {soul_path} (read_file it when lore, origin, duties detail, "
+            "or squad specifics are needed). Sections compiled out of this prompt: "
+            + "; ".join(cold_names)
+            + "."
+        )
+    compiled = "\n".join(head) + ("\n\n" if head and kept_intro else "") + "\n".join(kept_intro).rstrip()
+    if hot:
+        compiled += "\n\n" + "\n\n".join(hot)
+    compiled += cold_index
+    return compiled.strip() + "\n"
 
 
 def _read_context_file(path: Path) -> str:

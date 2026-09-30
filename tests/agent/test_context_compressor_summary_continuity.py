@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
+    OPEN_TAIL_HEADING,
     SUMMARY_PREFIX,
     _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER,
@@ -190,9 +191,13 @@ def test_resume_handoff_after_default_protected_head_decays_initial_turns():
     assert "original follow-up before first compaction" in prompt
     assert f"[ASSISTANT]: {SUMMARY_PREFIX}" not in prompt
     # Grounding (761a0b124e) may prepend a deterministic task-snapshot
-    # section — pin the contract, not the exact stored string.
+    # section — pin the contract, not the exact stored string. The OPEN-tail
+    # law (R14 §2 law 4, CONTEXT-DIET §4 lever 3) appends the mandatory OPEN
+    # section after the LLM body, so the contract is "contains the LLM summary
+    # body" — not endswith.
     stored_summary = compressor._previous_summary or ""
-    assert stored_summary.endswith("fresh summary")
+    assert "fresh summary" in stored_summary
+    assert OPEN_TAIL_HEADING in stored_summary
     assert old_summary not in stored_summary
     assert all(
         "original task before first compaction" not in str(msg.get("content", ""))
