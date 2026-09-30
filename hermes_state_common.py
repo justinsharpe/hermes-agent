@@ -593,6 +593,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_display_backfill
 CREATE INDEX IF NOT EXISTS idx_messages_display_identity
     ON messages(session_id, display_identity, display_order)
     WHERE display_identity IS NOT NULL AND (active = 1 OR compacted = 1);
+-- FC-17 carried-clone fallback: same key set as the display identity index but
+-- covering the rewind-flagged originals (active=0, compacted=0) an in-place
+-- rotation with tail_count>0 produces — the ONLY class invisible to the index
+-- above, and the identity sibling that betrays an unpinned clone as carried.
+-- Rare rows (one set per rotation), so the write-side cost is negligible.
+CREATE INDEX IF NOT EXISTS idx_messages_display_identity_rewound
+    ON messages(session_id, display_identity, id)
+    WHERE display_identity IS NOT NULL AND active = 0 AND compacted = 0;
 DROP TRIGGER IF EXISTS messages_display_order_insert;
 CREATE TRIGGER IF NOT EXISTS messages_display_order_insert
 AFTER INSERT ON messages WHEN new.display_order IS NULL
