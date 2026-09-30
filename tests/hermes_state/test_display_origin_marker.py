@@ -181,6 +181,127 @@ class TestDisplayProjectionUnchanged:
             "display projection row set must be identical with the marker active"
         )
 
+    def test_unpinned_identity_clones_marked_carried(self, db):
+        """The tail_count>0 clone path: originals are rewind-flagged
+        (active=0, compacted=0) BEFORE the copies insert, so the trigger
+        assigns each copy a FRESH display slot (display_order == id) — the
+        pin signature is absent and only the identity-clone fallback
+        (a lower-id rewound sibling sharing the display identity) can mark
+        the copy. Both clone paths must surface display_origin='carried'."""
+        sid = "chat"
+        db.create_session(sid, source="desktop")
+        for i in range(3):
+            db.append_message(sid, "user", f"user {i}")
+            db.append_message(sid, "assistant", f"assistant {i}")
+        live = db.get_messages_as_conversation(sid)
+        db.archive_and_compact(
+            sid,
+            [{"role": "user", "content": "[summary]"}] + live[-2:],
+            tail_count=2,
+        )
+
+        msgs = db.get_messages(sid, include_compacted=True)
+        raw = {r["id"]: r for r in db._read_all(
+            "SELECT id, display_order, display_identity, active, compacted FROM messages WHERE session_id = ?", (sid,))}
+
+        # The carried tail copies: the last live pair, re-inserted as fresh rows.
+        carried = [m for m in msgs if m.get("display_origin") == "carried"]
+        assert carried, "the tail_count>0 rotation must produce carried clones"
+        unpinned = [m for m in carried if raw[m["id"]]["display_order"] >= m["id"]]
+        assert unpinned, (
+            "seed must exercise the unpinned identity-clone path (display_order == id); "
+            "if every clone is pinned the fallback branch is untested here"
+        )
+        for m in unpinned:
+            sibling = raw[m["id"]]
+            assert sibling["display_identity"] is not None, (
+                "an unpinned carried clone must still carry a display identity "
+                "so the fallback EXISTS can match its rewound original"
+            )
+        # Their rewind-flagged originals are display-invisible (active=0, compacted=0)
+        # and marked 'rewound' only in audit reads — never rendered as duplicates.
+        display_ids = {m["id"] for m in msgs}
+        originals = [r for r in raw.values() if r["active"] == 0 and r["compacted"] == 0]
+        assert originals, "seed must leave rewind-flagged originals"
+        assert all(r["id"] not in display_ids for r in originals), (
+            "rewind-flagged originals must stay hidden from the display projection"
+        )
+        # Row-set parity still holds for this seed shape: one row per display slot.
+        orders = [raw[m["id"]]["display_order"] for m in msgs]
+        assert len(orders) == len(set(orders)), "display projection must not return a slot twice"
+
+    def test_paging_work_stays_bounded_with_carried_clones(self, db):
+        """The _carried_row_ids EXISTS fallback must stay index-bounded on a
+        rotation-carried workload. Regression: the pre-index form probed each
+        candidate row's earlier identity sibling via a session-prefix scan —
+        143,699 SQLite VM steps for one 120-row page on a 20k-row session
+        (over 1000x the page query itself); the hinted EXISTS form measured
+        61 steps. 10x rows must not cost even 3x steps."""
+        for sid, count in (("small", 2_000), ("large", 20_000)):
+            db.create_session(sid, source="desktop")
+            db.append_messages_batch(
+                sid, [{"role": "assistant", "content": f"row-{index}"} for index in range(count)],
+                chunk_rows=500)
+            watermark = db.get_active_message_watermark(sid)
+            # Tail rows that "arrived during the slow summary": the rotation
+            # rewind-flags their originals and re-sequences the clones — the
+            # identity-clone workload the EXISTS fallback must resolve.
+            db.append_messages_batch(
+                sid, [{"role": "user", "content": f"tail-{index}"} for index in range(20)],
+                chunk_rows=500)
+            db.archive_and_compact(
+                sid, [{"role": "assistant", "content": f"[summary {sid}]"}],
+                watermark=watermark, tail_count=0)
+
+        page = db.get_messages("large", include_compacted=True)
+        assert any(m.get("display_origin") == "carried" for m in page), (
+            "seed must produce carried clones the fallback has to resolve"
+        )
+        # Baseline: identical-size sessions with no rotation, so the bound
+        # isolates the carried-clone fallback's cost from the page query itself.
+        for sid, count in (("fresh-small", 2_000), ("fresh-large", 20_000)):
+            db.create_session(sid, source="desktop")
+            db.append_messages_batch(
+                sid, [{"role": "assistant", "content": f"row-{index}"} for index in range(count)],
+                chunk_rows=500)
+
+        db._wal_active = False
+
+        def progress_steps(sid):
+            callbacks = 0
+
+            def progress():
+                nonlocal callbacks
+                callbacks += 1
+                return 0
+
+            db._conn.set_progress_handler(progress, 100)
+            try:
+                page = db.get_messages(sid, include_compacted=True, latest=True, limit=120)
+            finally:
+                db._conn.set_progress_handler(None, 0)
+            assert len(page) == 120
+            return callbacks
+
+        small_steps = progress_steps("small")
+        large_steps = progress_steps("large")
+        fresh_small_steps = progress_steps("fresh-small")
+        fresh_large_steps = progress_steps("fresh-large")
+        # Relative bound: 10x rows must not cost even 3x steps on the carried
+        # workload (the pre-index regression measured 1000x).
+        assert large_steps < small_steps * 3, (
+            f"carried-clone paging must stay page-bounded: {large_steps} callbacks "
+            f"on 20k rows vs {small_steps} on 2k rows"
+        )
+        # Isolation bound: a carried-clone page may not cost an order of
+        # magnitude more than the same-size fresh page (the page query is
+        # identical; only the fallback differs). 2.5x absorbs VM-step jitter.
+        assert large_steps < fresh_large_steps * 2.5 + 25, (
+            f"the carried-clone fallback dominates the page read: {large_steps} "
+            f"callbacks vs {fresh_large_steps} for an identical fresh page"
+        )
+        assert fresh_large_steps < fresh_small_steps * 3
+
     def test_paging_row_set_unchanged_with_marker(self, db):
         """Paged display reads keep their exact row sets too (page through and
         reassemble)."""
