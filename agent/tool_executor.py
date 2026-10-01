@@ -1131,6 +1131,7 @@ def _commit_tool_result(
                 function_result,
                 call_id=tool_call_id or "",
                 duration_ms=int(tool_duration * 1000),
+                exit_code=_extract_tool_exit_code(function_result),
             )
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")

@@ -50,6 +50,7 @@ def trace_root(tmp_path):
 @pytest.fixture(autouse=True)
 def _no_active_trace(monkeypatch):
     rt._ACTIVE = None
+    rt._ACTIVE_AGENT = None
     # The redactor's default config lookup walks ~/.hermes — the suite's
     # home_io_guard refuses real-home I/O. Pin the packaged default config.
     monkeypatch.setenv(
@@ -61,6 +62,7 @@ def _no_active_trace(monkeypatch):
     yield
     red_mod._SHARED = None
     rt._ACTIVE = None
+    rt._ACTIVE_AGENT = None
 
 
 def _records(trace_root: str) -> list[dict]:
@@ -480,3 +482,123 @@ def test_ghp_longer_token_does_not_leak_suffix(trace_root):
 
     rec = _records(trace_root)[0]
     assert any(e["reason"] == "credential" for e in rec.get("redaction_log", []))
+
+
+# ----------------------------------------------------------------------
+# Regression: live-path conversation capture (root t_de037f34, run 854).
+# The live agent exposes its transcript at ``_session_messages`` — there is
+# no ``.messages`` attribute — and the terminal kanban close passes no agent.
+# Historical behavior: 127/127 live records carried the 1-entry system
+# placeholder. These tests pin the two live paths to the fixed behavior.
+# ----------------------------------------------------------------------
+
+
+class _LiveAgent:
+    """Attribute shape of the REAL worker agent (session_persistence:449)."""
+
+    session_id = "sess-live"
+    model = "glm-5.3"
+    provider = "zai"
+
+    def __init__(self):
+        self._session_messages = list(AGENT_MESSAGES) + [
+            {"role": "assistant", "content": "Working on the trace fix now."}
+        ]
+
+
+def test_terminal_close_without_agent_uses_registered_agent(trace_root, monkeypatch):
+    """The kanban terminal handlers close with no agent in scope; the agent
+    registered on the usage hook must supply the conversation."""
+    monkeypatch.setattr(rt, "prompt_builder_sha", lambda: "a" * 40)
+    monkeypatch.setattr(rt, "config_sha256", lambda: "b" * 64)
+    ctx = rt.start_run_trace(
+        run_id=42, profile_slug="viiy-coder", board_slug="specialized",
+        task_id="t_test1234", trace_root=trace_root,
+    )
+    assert ctx is not None
+
+    agent = _LiveAgent()
+    rt.record_provider_usage(
+        agent, {"input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0}, None
+    )
+    # The terminal-handler path: no agent argument at all.
+    rt.close_from_terminal_handler("kanban_complete")
+
+    rec = _records(trace_root)[0]
+    _assert_valid(rec, "completed")
+    roles = [m["role"] for m in rec["messages"]]
+    assert "assistant" in roles, f"assistant turns missing from terminal-close record: {roles}"
+    asst = [m for m in rec["messages"] if m["role"] == "assistant" and m.get("content")]
+    assert asst, "assistant content empty on terminal-close path"
+    assert rec["model"] == "glm-5.3"
+    assert rec["terminal_call"] == "kanban_complete"
+    assert rt.active_trace() is None
+
+
+def test_crash_path_session_messages_captured(trace_root, monkeypatch):
+    """close_run_trace(agent=...) must read ``_session_messages`` — the
+    historical ``getattr(agent, 'messages')`` returned None on the live agent,
+    producing the placeholder on crash-path records too."""
+    monkeypatch.setattr(rt, "prompt_builder_sha", lambda: "a" * 40)
+    monkeypatch.setattr(rt, "config_sha256", lambda: "b" * 64)
+    ctx = rt.start_run_trace(
+        run_id=42, profile_slug="viiy-coder", board_slug="specialized",
+        task_id="t_test1234", trace_root=trace_root,
+    )
+    assert ctx is not None
+
+    agent = _LiveAgent()
+    rt.record_provider_usage(agent, {"input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0}, None)
+    assert rt.close_run_trace("crashed", agent=agent, error=RuntimeError("boom"), exit_code=1)
+
+    rec = _records(trace_root)[0]
+    _assert_valid(rec, "crashed")
+    asst = [m for m in rec["messages"] if m["role"] == "assistant" and m.get("content")]
+    assert asst, "assistant content empty on crash path despite live agent"
+    assert rec["exit_code"] == 1
+    assert rec["error_class"] == "RuntimeError"
+
+
+def test_close_without_registration_keeps_placeholder(trace_root, monkeypatch):
+    """Crash before the first provider call: no agent ever registered — the
+    placeholder behavior must not regress."""
+    monkeypatch.setattr(rt, "prompt_builder_sha", lambda: "a" * 40)
+    monkeypatch.setattr(rt, "config_sha256", lambda: "b" * 64)
+    ctx = rt.start_run_trace(
+        run_id=42, profile_slug="viiy-coder", board_slug="specialized",
+        task_id="t_test1234", trace_root=trace_root,
+    )
+    assert ctx is not None
+    # No record_provider_usage call -> no registered agent.
+    rt.close_from_terminal_handler("kanban_block")
+    rec = _records(trace_root)[0]
+    _assert_valid(rec, "blocked")
+    assert len(rec["messages"]) == 1
+    assert rec["messages"][0]["role"] == "system"
+
+
+def test_record_tool_call_exit_code_populated_via_hook_shape(trace_root):
+    """The tool_executor call site passes exit_code extracted from the result
+    envelope (t_4f637fdb wiring, restored after the worktree collision)."""
+    ctx = _open_ctx(trace_root)
+    ctx.set_identity(session_id="s")
+    ctx.record_tool_call(
+        "terminal",
+        {"command": "ls"},
+        '{"output": "file1\\n", "exit_code": 0, "error": null}',
+        call_id="c_exit",
+        duration_ms=2,
+        exit_code=0,
+    )
+    ctx.record_tool_call(
+        "execute_code",
+        {"code": "print(1)"},
+        {"output": "1", "exit_code": 0, "error": None},
+        call_id="c_exit2",
+        duration_ms=3,
+        exit_code=0,
+    )
+    ctx.close(outcome="completed", agent_messages=AGENT_MESSAGES)
+    rec = _records(trace_root)[0]
+    codes = [tc["exit_code"] for tc in rec["tool_calls"]]
+    assert codes == [0, 0], f"exit_codes not populated: {codes}"

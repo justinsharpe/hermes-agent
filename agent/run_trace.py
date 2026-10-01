@@ -65,6 +65,13 @@ def run_trace_enabled() -> bool:
     }
 
 
+# Last agent seen on the usage hook (turn_usage.record_response_usage runs with the
+# live agent on every provider call). The terminal kanban handlers close the trace
+# from module scope with no agent in scope, so they close from this reference.
+# Strong ref is fine: the ctx and the agent share the worker-process lifetime.
+_ACTIVE_AGENT: Any = None
+
+
 def active_trace() -> Optional["RunTraceContext"]:
     return _ACTIVE
 
@@ -505,11 +512,31 @@ def start_run_trace(
     return _ACTIVE
 
 
+def _agent_conversation(agent: Any) -> Optional[List[Dict[str, Any]]]:
+    """The live agent's conversation, or None.
+
+    The live agent exposes its transcript as ``_session_messages`` (a plain list;
+    ``session_persistence._persist`` sets it) — there is no ``.messages`` attribute,
+    so the historical ``getattr(agent, "messages", None)`` always returned None and
+    every record carried the system placeholder. ``messages`` is still honored for
+    test doubles and future agent shapes.
+    """
+    for attr in ("_session_messages", "messages"):
+        with suppress(Exception):
+            candidate = getattr(agent, attr, None)
+            if isinstance(candidate, list) and candidate:
+                return candidate
+    return None
+
+
 def record_provider_usage(agent: Any, usage: Optional[Dict[str, Any]], cost_usd: Optional[float]) -> None:
     """Hook for ``agent/turn_usage.record_response_usage``."""
+    global _ACTIVE_AGENT
     ctx = _ACTIVE
     if ctx is None:
         return
+    if agent is not None:
+        _ACTIVE_AGENT = agent
     try:
         ctx.set_identity(
             session_id=str(getattr(agent, "session_id", "") or ""),
@@ -580,6 +607,12 @@ def close_run_trace(
     if error is not None:
         error_class = type(error).__name__
     messages = None
+    if agent is None:
+        # Terminal kanban handlers close from module scope with no agent in scope;
+        # fall back to the agent registered on the usage hook so the conversation
+        # still lands on that path. No registration (crash before first provider
+        # call) keeps the placeholder — the documented crash-path behavior.
+        agent = _ACTIVE_AGENT
     if agent is not None:
         with suppress(Exception):
             ctx.set_identity(
@@ -587,9 +620,7 @@ def close_run_trace(
                 model=str(getattr(agent, "model", "") or ""),
                 provider=str(getattr(agent, "provider", "") or ""),
             )
-        messages = getattr(agent, "messages", None)
-        if not isinstance(messages, list):
-            messages = None
+        messages = _agent_conversation(agent)
     try:
         return ctx.close(
             outcome=outcome,
