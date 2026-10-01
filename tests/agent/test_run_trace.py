@@ -51,6 +51,7 @@ def trace_root(tmp_path):
 def _no_active_trace(monkeypatch):
     rt._ACTIVE = None
     rt._ACTIVE_AGENT = None
+    rt._LIVE_MESSAGES = None
     # The redactor's default config lookup walks ~/.hermes — the suite's
     # home_io_guard refuses real-home I/O. Pin the packaged default config.
     monkeypatch.setenv(
@@ -63,6 +64,7 @@ def _no_active_trace(monkeypatch):
     red_mod._SHARED = None
     rt._ACTIVE = None
     rt._ACTIVE_AGENT = None
+    rt._LIVE_MESSAGES = None
 
 
 def _records(trace_root: str) -> list[dict]:
@@ -602,3 +604,85 @@ def test_record_tool_call_exit_code_populated_via_hook_shape(trace_root):
     rec = _records(trace_root)[0]
     codes = [tc["exit_code"] for tc in rec["tool_calls"]]
     assert codes == [0, 0], f"exit_codes not populated: {codes}"
+
+
+# ----------------------------------------------------------------------
+# Regression: final-turn capture via the live message list (root t_de037f34).
+# The terminal kanban handlers close the trace INSIDE the tool round, before
+# the turn-boundary persist syncs agent._session_messages. Without the live
+# list registration, every record dropped the run's final assistant turn —
+# the row carrying the text output and the terminal tool_call.
+# ----------------------------------------------------------------------
+
+
+def test_live_messages_registered_before_terminal_close(trace_root, monkeypatch):
+    """The live in-flight list (with the final assistant turn appended) must win
+    over the turn-stale agent transcript at close time."""
+    monkeypatch.setattr(rt, "prompt_builder_sha", lambda: "a" * 40)
+    monkeypatch.setattr(rt, "config_sha256", lambda: "b" * 64)
+    ctx = rt.start_run_trace(
+        run_id=42, profile_slug="viiy-coder", board_slug="specialized",
+        task_id="t_test1234", trace_root=trace_root,
+    )
+    assert ctx is not None
+
+    # The turn-stale agent transcript: everything except the final assistant turn.
+    agent = _LiveAgent()  # _session_messages lacks the final turn
+    stale = list(AGENT_MESSAGES)
+    agent._session_messages = stale
+    rt.record_provider_usage(
+        agent, {"input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0}, None
+    )
+
+    # _execute_tool_calls registers the live list — which by then contains the
+    # final assistant row (text + terminal tool_calls) appended by the loop.
+    live = stale + [
+        {"role": "assistant", "content": "Final answer text before completing.", "tool_calls": [{"id": "call_9"}]},
+    ]
+    rt.register_live_messages(live)
+
+    rt.close_from_terminal_handler("kanban_complete")
+
+    rec = _records(trace_root)[0]
+    _assert_valid(rec, "completed")
+    asst = [m for m in rec["messages"] if m["role"] == "assistant" and m.get("content")]
+    assert asst, "final assistant turn missing from terminal-close record"
+    assert any("Final answer text" in m["content"] for m in asst), (
+        f"final assistant text absent: {[m.get('content') for m in rec['messages']]}"
+    )
+    assert rt._LIVE_MESSAGES is None  # cleared on close
+
+
+def test_live_messages_stale_falls_back_to_agent_transcript(trace_root, monkeypatch):
+    """When the agent's transcript is longer than the registered live list
+    (close happened after a subsequent turn persisted), the longer view wins."""
+    monkeypatch.setattr(rt, "prompt_builder_sha", lambda: "a" * 40)
+    monkeypatch.setattr(rt, "config_sha256", lambda: "b" * 64)
+    ctx = rt.start_run_trace(
+        run_id=42, profile_slug="viiy-coder", board_slug="specialized",
+        task_id="t_test1234", trace_root=trace_root,
+    )
+    assert ctx is not None
+
+    longer = list(AGENT_MESSAGES) + [
+        {"role": "assistant", "content": "Persisted post-round turn."},
+    ]
+    agent = _LiveAgent()
+    agent._session_messages = longer
+    rt.record_provider_usage(
+        agent, {"input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cache_write_tokens": 0}, None
+    )
+    rt.register_live_messages(list(AGENT_MESSAGES))  # shorter/stale
+    rt.close_from_terminal_handler("kanban_complete")
+
+    rec = _records(trace_root)[0]
+    _assert_valid(rec, "completed")
+    asst_texts = [m.get("content") for m in rec["messages"] if m["role"] == "assistant"]
+    assert any(t == "Persisted post-round turn." for t in asst_texts), asst_texts
+
+
+def test_register_live_messages_ignores_non_list(trace_root):
+    rt.register_live_messages(None)
+    rt.register_live_messages("not-a-list")
+    rt.register_live_messages([])
+    assert rt._LIVE_MESSAGES is None

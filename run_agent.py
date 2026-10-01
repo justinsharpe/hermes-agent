@@ -14,6 +14,7 @@ except ModuleNotFoundError as exc:  # partial `hermes update` left the bootstrap
         raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
 
 import sys
+import contextlib
 
 # `hermes-agent` runs this module without hermes_cli.main, which repairs a `hermes update` killed
 # while git wrote the new tree; do it here, before importing anything else from the checkout.
@@ -1332,6 +1333,15 @@ class AIAgent(
         tool_calls = assistant_message.tool_calls
         args = (assistant_message, messages, effective_task_id, api_call_count)
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
+        # Per-run trace: register the live in-flight message list BEFORE any tool
+        # handler runs. The terminal kanban handlers close the trace inside this
+        # round — before the turn-boundary persist syncs agent._session_messages —
+        # so without this registration the close snapshots a turn-stale transcript
+        # and drops the final assistant turn (run's text output + terminal call).
+        with contextlib.suppress(Exception):
+            from agent.run_trace import register_live_messages
+
+            register_live_messages(messages)
         try:
             with scoped_connection_surface(agent_connection_surface(self)):
                 if len(tool_calls) <= 1:

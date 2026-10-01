@@ -71,6 +71,32 @@ def run_trace_enabled() -> bool:
 # Strong ref is fine: the ctx and the agent share the worker-process lifetime.
 _ACTIVE_AGENT: Any = None
 
+# The in-flight turn's live ``messages`` list, registered by
+# run_agent._execute_tool_calls before any tool handler runs. The terminal kanban
+# handlers close the trace INSIDE the tool round — before the turn-boundary persist
+# syncs ``agent._session_messages`` (turn_tool_round.py:212, session_persistence:449)
+# — so snapshotting the agent attribute alone always misses the final assistant turn
+# (the row carrying the run's text output and the terminal tool_call). The list is
+# mutated in place by the tool executors, so a reference taken here stays current.
+_LIVE_MESSAGES: Optional[List[Dict[str, Any]]] = None
+
+
+def register_live_messages(messages: Any) -> None:
+    """Record the in-flight turn's live message list for the trace close.
+
+    Called from run_agent._execute_tool_calls with the same list object the
+    conversation loop appends to. Registration is best-effort and never raises.
+    """
+    global _LIVE_MESSAGES
+    if isinstance(messages, list) and messages:
+        _LIVE_MESSAGES = messages
+
+
+def _clear_live_messages() -> None:
+    """Drop the live-message registration (trace closed; next run re-registers)."""
+    global _LIVE_MESSAGES
+    _LIVE_MESSAGES = None
+
 
 def active_trace() -> Optional["RunTraceContext"]:
     return _ACTIVE
@@ -495,6 +521,8 @@ def start_run_trace(
         return None
     if _ACTIVE is not None:
         return _ACTIVE
+    global _LIVE_MESSAGES
+    _LIVE_MESSAGES = None
     try:
         _ACTIVE = RunTraceContext(
             run_id=run_id if isinstance(run_id, int) else _next_run_id(),
@@ -515,18 +543,39 @@ def start_run_trace(
 def _agent_conversation(agent: Any) -> Optional[List[Dict[str, Any]]]:
     """The live agent's conversation, or None.
 
-    The live agent exposes its transcript as ``_session_messages`` (a plain list;
-    ``session_persistence._persist`` sets it) — there is no ``.messages`` attribute,
-    so the historical ``getattr(agent, "messages", None)`` always returned None and
-    every record carried the system placeholder. ``messages`` is still honored for
-    test doubles and future agent shapes.
+    Preference order:
+    1. ``_LIVE_MESSAGES`` — the in-flight turn's list, registered by
+       ``run_agent._execute_tool_calls``. The terminal kanban close fires inside
+       the tool round, before the turn-boundary persist syncs
+       ``agent._session_messages``; the agent attribute therefore lags one full
+       turn and drops the final assistant row (the run's text output + terminal
+       tool_call). The live list is the only source that has it.
+    2. ``_session_messages`` — the live agent's persisted transcript
+       (``session_persistence._persist`` sets it; there is no ``.messages``
+       attribute, so the historical ``getattr(agent, "messages", None)`` always
+       returned None and every record carried the system placeholder).
+    3. ``messages`` — test doubles and future agent shapes.
+
+    The registered live list must be a non-empty prefix-compatible view: when the
+    agent's own transcript is longer (a later turn already persisted), prefer the
+    agent's — the live list is stale only in the impossible case of a close after
+    a full additional turn.
     """
-    for attr in ("_session_messages", "messages"):
-        with suppress(Exception):
-            candidate = getattr(agent, attr, None)
-            if isinstance(candidate, list) and candidate:
-                return candidate
-    return None
+    candidates = []
+    if _LIVE_MESSAGES:
+        candidates.append(_LIVE_MESSAGES)
+    if agent is not None:
+        for attr in ("_session_messages", "messages"):
+            with suppress(Exception):
+                candidate = getattr(agent, attr, None)
+                if isinstance(candidate, list) and candidate:
+                    candidates.append(candidate)
+                    break
+    if not candidates:
+        return None
+    # Longest transcript wins: the live in-flight list contains the final
+    # assistant turn; the agent attribute catches up only after the round ends.
+    return max(candidates, key=len)
 
 
 def record_provider_usage(agent: Any, usage: Optional[Dict[str, Any]], cost_usd: Optional[float]) -> None:
@@ -632,6 +681,7 @@ def close_run_trace(
     finally:
         # Emit-once regardless of write success: a retry would double-append.
         _ACTIVE = None
+        _clear_live_messages()
 
 
 def close_from_terminal_handler(tool_name: str) -> None:
