@@ -49,7 +49,9 @@ def test_bootstrap_import_exports_scratch_to_process_and_children(tmp_path):
 def test_prune_removes_idle_entries_and_keeps_trees_written_deep_inside(tmp_path):
     """Idle retention: an entry goes when nothing in its subtree was written within the window;
     a tree whose only recent write is three levels down is still in use and stays, even though
-    its top-level mtime is ancient (a directory's mtime ignores writes below its children)."""
+    its top-level mtime is ancient (a directory's mtime ignores writes below its children).
+    "Goes" means quarantined, not destroyed: the entry and its contents survive in
+    ``<scratch>-quarantine/`` until the grace window expires, and the move is logged."""
     scratch = get_scratch_dir(tmp_path, prune=False)
     idle, live, fresh = scratch / "idle", scratch / "live", scratch / "fresh.txt"
     deep = live / "lane" / "wt"
@@ -63,6 +65,10 @@ def test_prune_removes_idle_entries_and_keeps_trees_written_deep_inside(tmp_path
         os.utime(path, (ancient, ancient))
     assert prune_scratch_dir(scratch) == 1
     assert not idle.exists() and live.exists() and fresh.exists()
+    quarantined = scratch.parent / "scratch-quarantine" / "idle"
+    assert quarantined.is_dir() and (quarantined / "f").read_text(encoding="utf-8") == "x"
+    log = (scratch.parent / "scratch-prune.log").read_text(encoding="utf-8")
+    assert "action=quarantined entry='idle'" in log
 
 
 @pytest.mark.platforms("posix")  # POSIX directory modes
@@ -247,6 +253,8 @@ def test_prune_reaps_process_living_in_idle_entry_and_spares_live_tree(tmp_path)
         assert doomed.wait(timeout=10) is not None
         assert spared.poll() is None
         assert not idle.parent.exists() and live.exists()
+        # The idle entry was quarantined (recoverable), not destroyed outright.
+        assert (scratch.parent / "scratch-quarantine" / "idle-lane").is_dir()
     finally:
         for proc in (doomed, spared):
             if proc.poll() is None:
@@ -255,7 +263,7 @@ def test_prune_reaps_process_living_in_idle_entry_and_spares_live_tree(tmp_path)
 
 
 def test_prune_releases_git_worktree_registration_of_idle_entry(tmp_path):
-    """Deleting a scratch entry that held a linked worktree leaves the repo with no
+    """Quarantining a scratch entry that held a linked worktree leaves the repo with no
     dangling registration (10 sat in one repo's ``git worktree list`` after cleanup)."""
     import subprocess
 
@@ -280,7 +288,86 @@ def test_prune_releases_git_worktree_registration_of_idle_entry(tmp_path):
         for name in dirnames + filenames:
             os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
     os.utime(tree.parent, (ancient, ancient))
+    # Phase 1: quarantine keeps the worktree tree intact (recoverable) and the path empty.
     assert prune_scratch_dir(scratch) == 1
+    assert not tree.exists()
+    assert (scratch.parent / "scratch-quarantine" / "lane").is_dir()
+    # Phase 2: once the grace window expires (here: zero hours), the entry is finally
+    # deleted and the repo is left with no dangling registration.
+    quarantine_tree = scratch.parent / "scratch-quarantine" / "lane" / "abwt"
+    stamp = scratch.parent / "scratch-quarantine" / "lane" / ".quarantined-at"
+    stamp.write_text(f"{time.time() - 3600}\n", encoding="utf-8")
+    os.environ["HERMES_SCRATCH_QUARANTINE_HOURS"] = "0"
+    try:
+        assert prune_scratch_dir(scratch) == 1
+    finally:
+        os.environ.pop("HERMES_SCRATCH_QUARANTINE_HOURS", None)
     listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True,
                              text=True, stdin=subprocess.DEVNULL, check=True).stdout
-    assert str(tree) not in listing and not tree.exists()
+    assert str(tree) not in listing and not tree.exists() and not quarantine_tree.exists()
+
+
+class TestScratchPruneSafeguards:
+    """The 2026-10 quarantine contract: idle entries quarantine with a grace window and a
+    departure log; ``.scratch-keep`` exempts an entry entirely. Silent sweeps are the bug
+    these tests pin down (five deliverable-grade entries were destroyed on one install
+    before quarantining existed)."""
+
+    def _age_entry(self, entry, hours=30):
+        ancient = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(entry):
+            for name in dirnames + filenames:
+                os.utime(os.path.join(dirpath, name), (ancient, ancient), follow_symlinks=False)
+        os.utime(entry, (ancient, ancient))
+
+    def test_keep_marker_exempts_entry_from_prune(self, tmp_path):
+        scratch = get_scratch_dir(tmp_path, prune=False)
+        parked = scratch / "precious"
+        parked.mkdir()
+        (parked / "deliverable.md").write_text("x", encoding="utf-8")
+        (parked / ".scratch-keep").write_text("multi-day lane\n", encoding="utf-8")
+        self._age_entry(parked)
+        assert prune_scratch_dir(scratch) == 0
+        assert (parked / "deliverable.md").exists()
+
+    def test_quarantine_grace_window_holds_entry_then_deletes(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SCRATCH_QUARANTINE_HOURS", "0.00027")  # ~1 second
+        scratch = get_scratch_dir(tmp_path, prune=False)
+        parked = scratch / "bench"
+        parked.mkdir()
+        (parked / "out.md").write_text("result", encoding="utf-8")
+        self._age_entry(parked)
+        # Phase 1: quarantined, intact, logged.
+        assert prune_scratch_dir(scratch) == 1
+        q = scratch.parent / "scratch-quarantine" / "bench"
+        assert q.is_dir() and (q / "out.md").read_text(encoding="utf-8") == "result"
+        log = (scratch.parent / "scratch-prune.log").read_text(encoding="utf-8")
+        assert "action=quarantined entry='bench'" in log
+        time.sleep(1.2)  # let the ~1s grace expire
+        # Phase 2: final deletion, logged again.
+        assert prune_scratch_dir(scratch) == 1
+        assert not q.exists()
+        log = (scratch.parent / "scratch-prune.log").read_text(encoding="utf-8")
+        assert "action=deleted entry='bench'" in log and "source=quarantine" in log
+
+    def test_quarantine_survives_name_collision(self, tmp_path):
+        scratch = get_scratch_dir(tmp_path, prune=False)
+        q = scratch.parent / "scratch-quarantine"
+        q.mkdir()
+        (q / "lane-a").mkdir()  # a previous pass already holds this name
+        entry = scratch / "lane-a"
+        entry.mkdir()
+        (entry / "f").write_text("newer", encoding="utf-8")
+        self._age_entry(entry)
+        assert prune_scratch_dir(scratch) == 1
+        names = {p.name.split(".")[0] for p in q.iterdir()}
+        assert names == {"lane-a"} and len(list(q.iterdir())) == 2
+
+    def test_unreadable_quarantine_dir_does_not_break_prune(self, tmp_path):
+        scratch = get_scratch_dir(tmp_path, prune=False)
+        parked = scratch / "solo"
+        parked.mkdir()
+        (parked / "f").write_text("x", encoding="utf-8")
+        self._age_entry(parked)
+        assert prune_scratch_dir(scratch) == 1
+        assert (scratch.parent / "scratch-quarantine" / "solo").is_dir()

@@ -1,9 +1,17 @@
 """Scratch-dir retention: idle detection plus the reaping an idle tree needs before it goes.
 
-Deleting an idle ``cache/scratch/<entry>`` is not enough on its own: a lane's e2e run leaves
-headless browsers whose cwd was inside the tree (they survived for days with a ``(deleted)``
-cwd), and a repo whose linked worktree lived in the tree keeps a dangling registration until
-someone runs ``git worktree prune``. Both are reaped here, right before ``rmtree``.
+Idle entries are not deleted outright anymore: they are *quarantined* — moved to a sibling
+``<scratch>-quarantine/`` directory for ``HERMES_SCRATCH_QUARANTINE_HOURS`` (default 72) first.
+A multi-day lane that parked a deliverable in scratch loses hours, not the work, and every
+departure is logged to ``<scratch>-prune.log`` beside the root so silent sweeps cannot happen.
+An entry holding a ``.scratch-keep`` file is exempt entirely — the one-file contract for
+agents protecting work.
+
+Deleting a quarantined entry still needs the reaping: a lane's e2e run leaves headless
+browsers whose cwd was inside the tree (they survived for days with a ``(deleted)`` cwd),
+and a repo whose linked worktree lived in the tree keeps a dangling registration until
+someone runs ``git worktree prune``. Expired entries are reaped and released right before
+their ``rmtree``.
 """
 from __future__ import annotations
 
@@ -20,6 +28,66 @@ logger = logging.getLogger(__name__)
 _REAP_GRACE_SECONDS = 3.0
 # ``.git`` files (linked worktrees) are looked for this deep; lanes nest repo/tree/subtree.
 _GIT_FILE_MAX_DEPTH = 4
+# An entry carrying this marker file anywhere in its top level is never pruned: the
+# one-file contract for lanes that need a multi-day parking spot in scratch.
+SCRATCH_KEEP_MARKER = ".scratch-keep"
+# Quarantined entries live this long before final deletion (env-overridable).
+_QUARANTINE_HOURS_DEFAULT = 72.0
+
+
+def _quarantine_hours() -> float:
+    """``HERMES_SCRATCH_QUARANTINE_HOURS`` when set and parseable, else 72."""
+    raw = os.environ.get("HERMES_SCRATCH_QUARANTINE_HOURS", "").strip()
+    try:
+        hours = float(raw)
+        if hours >= 0:
+            return hours
+    except ValueError:
+        pass
+    return _QUARANTINE_HOURS_DEFAULT
+
+
+def _entry_is_kept(entry: Path) -> bool:
+    """True when the entry opts out of pruning via the keep-marker contract."""
+    try:
+        return (entry / SCRATCH_KEEP_MARKER).exists()
+    except OSError:
+        return False  # unreadable: not proof of keep; the idle test decides
+
+
+def _prune_log_path(scratch_root: Path) -> Path:
+    """``<scratch>/../scratch-prune.log`` lives beside the scratch root, outside the sweep."""
+    return scratch_root.parent / "scratch-prune.log"
+
+
+def _log_departure(scratch_root: Path, action: str, entry: Path, note: str = "") -> None:
+    """Append one line per pruned/quarantined entry; never raises into the prune path."""
+    try:
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} action={action} entry={entry.name!r} bytes={_tree_bytes(entry)}{(' ' + note) if note else ''}\n"
+        with open(_prune_log_path(scratch_root), "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass  # logging must never break the prune
+
+
+def _tree_bytes(entry: Path) -> int:
+    """Total bytes under *entry* (files only); 0 on any error — a log nicety, not a guarantee."""
+    total = 0
+    stack = [str(entry)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for child in it:
+                    try:
+                        if child.is_dir(follow_symlinks=False):
+                            stack.append(child.path)
+                        else:
+                            total += child.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
 
 
 def subtree_touched_since(path: Path, cutoff: float) -> bool:
@@ -165,34 +233,88 @@ def release_git_worktrees(repos: set[str]) -> None:
 
 
 def prune_idle_entries(root: Path, max_idle_hours: float, skip_names: frozenset[str]) -> int:
-    """Delete top-level entries of *root* with no write anywhere in their subtree for
-    *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
-    Returns the count removed."""
+    """Quarantine top-level entries of *root* with no write anywhere in their subtree for
+    *max_idle_hours*, and finally delete quarantined entries once their grace expires.
+    Keep-marked entries (``.scratch-keep``) are never touched. Every departure is logged
+    to ``<root>/../scratch-prune.log``. Returns the count of entries that left the root
+    (quarantined this pass + deleted from quarantine this pass)."""
     cutoff = time.time() - max_idle_hours * 3600
+    quarantine = root.parent / (root.name + "-quarantine")
+    quarantine.mkdir(parents=True, exist_ok=True)
     try:
         entries = [e for e in root.iterdir() if e.name not in skip_names]
     except OSError:
         return 0
-    doomed = [e for e in entries if not subtree_touched_since(e, cutoff)]
+    doomed = [e for e in entries if not subtree_touched_since(e, cutoff) and not _entry_is_kept(e)]
     # Runs even with nothing to delete: orphans whose cwd was removed by an earlier pass
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:
         reap_processes_rooted_in(root, doomed)
     except Exception as exc:  # psutil missing or restricted host: the deletion still proceeds
         logger.debug("scratch prune: process reap skipped: %s", exc)
-    if not doomed:
-        return 0
-    repos: set[str] = set()
-    removed = 0
+    moved = 0
     for entry in doomed:
+        target = quarantine / entry.name
+        if target.exists():
+            # A previous pass already quarantined this name: keep both by suffixing the move.
+            target = quarantine / f"{entry.name}.prior-{int(time.time())}"
+        try:
+            shutil.move(str(entry), str(target))
+            _stamp_quarantine(target)
+            moved += 1
+            _log_departure(root, "quarantined", entry, f"grace_hours={_quarantine_hours():g} to={target.name}")
+        except OSError as exc:
+            logger.debug("scratch prune: quarantine move failed for %s: %s", entry, exc)
+            continue
+    # Final deletion for entries whose grace expired while in quarantine.
+    grace_seconds = _quarantine_hours() * 3600
+    removed = 0
+    try:
+        expired = [e for e in quarantine.iterdir() if _quarantined_expired(e, grace_seconds)]
+    except OSError:
+        expired = []
+    for entry in expired:
+        repos: set[str] = set()
         try:
             if entry.is_dir() and not entry.is_symlink():
-                repos |= _linked_worktree_repos(entry)
+                repos = _linked_worktree_repos(entry)
+                reap_processes_rooted_in(quarantine, [entry])
                 shutil.rmtree(entry, ignore_errors=True)
             else:
                 entry.unlink()
             removed += 1
+            _log_departure(root, "deleted", entry, "source=quarantine")
+            release_git_worktrees(repos)
         except OSError:
             continue
-    release_git_worktrees(repos)
-    return removed
+    return moved + removed
+
+
+_QUARANTINE_STAMP = ".quarantined-at"
+
+
+def _stamp_quarantine(entry: Path) -> None:
+    """Anchor the grace window at quarantine time. Directories carry a stamp file inside;
+    a top-level *file* entry cannot, so its mtime is reset to now instead (the expiry
+    fallback reads subtree mtimes, so the anchor is the same either way)."""
+    try:
+        if entry.is_dir() and not entry.is_symlink():
+            (entry / _QUARANTINE_STAMP).write_text(f"{time.time()}\n", encoding="utf-8")
+        else:
+            os.utime(entry, None)
+    except OSError:
+        pass
+
+
+def _quarantined_expired(entry: Path, grace_seconds: float) -> bool:
+    """True when a quarantined entry's grace window has elapsed. The stamp written at
+    quarantine time is the start of grace; an entry without one (moved by hand) falls
+    back to whole-subtree idleness, and a keep-marker exempts it from final deletion."""
+    if _entry_is_kept(entry):
+        return False
+    stamp = entry / _QUARANTINE_STAMP
+    try:
+        quarantined_at = float(stamp.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return not subtree_touched_since(entry, time.time() - grace_seconds)
+    return (time.time() - quarantined_at) >= grace_seconds
