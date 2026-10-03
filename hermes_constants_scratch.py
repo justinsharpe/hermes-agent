@@ -60,10 +60,12 @@ def _prune_log_path(scratch_root: Path) -> Path:
     return scratch_root.parent / "scratch-prune.log"
 
 
-def _log_departure(scratch_root: Path, action: str, entry: Path, note: str = "") -> None:
+def _log_departure(scratch_root: Path, action: str, entry: Path, note: str = "", size: int | None = None) -> None:
     """Append one line per pruned/quarantined entry; never raises into the prune path."""
     try:
-        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} action={action} entry={entry.name!r} bytes={_tree_bytes(entry)}{(' ' + note) if note else ''}\n"
+        if size is None:
+            size = _tree_bytes(entry)
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} action={action} entry={entry.name!r} bytes={size}{(' ' + note) if note else ''}\n"
         with open(_prune_log_path(scratch_root), "a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError:
@@ -259,10 +261,11 @@ def prune_idle_entries(root: Path, max_idle_hours: float, skip_names: frozenset[
             # A previous pass already quarantined this name: keep both by suffixing the move.
             target = quarantine / f"{entry.name}.prior-{int(time.time())}"
         try:
+            size = _tree_bytes(entry)  # before the move: the source path is gone afterwards
             shutil.move(str(entry), str(target))
             _stamp_quarantine(target)
             moved += 1
-            _log_departure(root, "quarantined", entry, f"grace_hours={_quarantine_hours():g} to={target.name}")
+            _log_departure(root, "quarantined", entry, f"grace_hours={_quarantine_hours():g} to={target.name}", size=size)
         except OSError as exc:
             logger.debug("scratch prune: quarantine move failed for %s: %s", entry, exc)
             continue
