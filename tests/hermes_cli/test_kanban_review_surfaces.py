@@ -229,6 +229,31 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
         assert secret not in json.dumps(event.payload)
 
 
+def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None:
+    """Updated for KANBAN_GUIDANCE_V2 (t_78a3c4c9). The semantic contract is
+    unchanged: a worker on a parent card that has a pre-created review/QA/release
+    child must call kanban_complete (NOT kanban_request_review on the same card,
+    NOT a sticky block) so the child gets dispatched. The exact wording differs
+    because V2 dissolved the old numbered "step 5" prose into a 5-branch
+    decision tree. We assert against the V2 phrasing. See RATIONALE.md.
+    """
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert "pre-created review child" in KANBAN_GUIDANCE
+    assert "kanban_complete" in KANBAN_GUIDANCE
+    assert "kanban_request_changes" in KANBAN_GUIDANCE
+    assert "metadata=..." in KANBAN_GUIDANCE
+    kanban_defaults = DEFAULT_CONFIG["kanban"]
+    assert isinstance(kanban_defaults, dict)
+    assert kanban_defaults["review_dispatch"] is True
+
+    repo_root = Path(__file__).resolve().parents[2]
+    review_skill = repo_root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
+    skill_text = review_skill.read_text(encoding="utf-8")
+    assert "kanban_request_changes" in skill_text
+    assert "approve" in skill_text.lower()
+    assert "escalate" in skill_text.lower()
 
 
 def test_cli_reopen_review_is_transition_first_and_redacts_reason(
