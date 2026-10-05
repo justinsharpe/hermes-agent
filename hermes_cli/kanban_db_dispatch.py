@@ -2340,6 +2340,17 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    elif lane == "build":
+        # Quality floor (2026-10-04, principal-directed after the Brandon-
+        # package bugs): every BUILD worker force-loads the pre-ship sweep
+        # pair — verification-gates (prove-before-claim) + hostile-reader-
+        # sweep (leak/dead-code/overclaim grep). Cheap, load-bearing, and
+        # the reason the squad's October numbers must beat September's.
+        claimed.skills = list(dict.fromkeys([
+            *(claimed.skills or []),
+            "verification-gates",
+            "hostile-reader-sweep",
+        ]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2640,7 +2651,7 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="build", **lane_kwargs):
             spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
