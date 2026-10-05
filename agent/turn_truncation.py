@@ -297,6 +297,51 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
     return None
 
 
+def _clean_eof_fallback(st: _Trunc, _retry: TurnRetryState, n: int) -> Optional[TruncationVerdict]:
+    """(local patch viiy 2026-10-05, ollama-cloud stream cuts) A stream the server
+    closed cleanly with no finish_reason is a serving-path defect, not a size or
+    network problem: continuation nudges re-request from the same path, so a
+    provider that dropped the stream once commonly drops it again. After the
+    second clean-EOF cut in one turn, escalate to the configured fallback chain
+    (same contract as the content-filter escalation above) instead of a third
+    same-provider attempt; without a fallback configured, fall through to the
+    normal continuation ladder (behavior unchanged)."""
+    agent = st.agent
+    if not (
+        st.is_stub
+        and getattr(st.response, "_clean_eof", False)
+        and n >= 2
+        and agent._fallback_index < len(agent._fallback_chain)
+    ):
+        return None
+    agent._vprint(
+        f"{agent.log_prefix}🛡️  Server ended the stream cleanly {n}× without finish_reason "
+        f"— switching to fallback provider...",
+        force=True, diagnostic=True,
+    )
+    agent._emit_diagnostic_status("Stream closed cleanly mid-response twice; switching to fallback...")
+    if agent._try_activate_fallback():
+        if st.truncated_response_parts:
+            st.messages = agent._get_messages_up_to_last_assistant(st.messages)
+        for _frag in st.messages:
+            if isinstance(_frag, dict):
+                _frag.pop("_length_continuation_fragment", None)
+                _frag.pop("_length_continuation_nudge", None)
+        agent._session_messages = st.messages
+        st.length_continue_retries = 0
+        st.truncated_response_parts = []
+        st.retry_count = 0
+        st.compression_attempts = 0
+        _retry.primary_recovery_attempted = False
+        _retry.restart_with_rebuilt_messages = True
+        return st.done("break")
+    agent._vprint(
+        f"{agent.log_prefix}⚠️  Fallback activation failed — continuing with same provider...",
+        force=True, diagnostic=True,
+    )
+    return None
+
+
 def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -> TruncationVerdict:
     """Text truncation (no tool calls): append the fragment + a continuation nudge (up to
     4), then the ceiling exit that drops the fragment trail and keeps the stitched partial.
@@ -515,6 +560,21 @@ def recover_from_truncation(
         cf = _content_filter_fallback(st, _retry)
         if cf is not None:
             return cf
+        # (local patch viiy 2026-10-05) clean-EOF stream cuts: escalate to the
+        # fallback chain after the 2nd cut in one turn instead of a 3rd
+        # same-provider attempt. Text-only stubs only (mid-tool-call stubs keep
+        # the existing 4x chunked-retry ladder: the tool call must complete).
+        ceof = (
+            _clean_eof_fallback(st, _retry, st.length_continue_retries)
+            if (
+                st.is_stub
+                and getattr(st.response, "_clean_eof", False)
+                and not _trunc_has_tool_calls
+            )
+            else None
+        )
+        if ceof is not None:
+            return ceof
         if _trunc_msg is not None:
             if not _trunc_has_tool_calls:
                 return _continue_text(st, _retry, _trunc_msg)
