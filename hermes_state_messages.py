@@ -1906,6 +1906,32 @@ class SessionMessagesMixin:
             "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
             (session_id, platform_message_id)) is not None
 
+    def active_message_uid_exists(self, session_id: str, uids: List[str]) -> Dict[str, bool]:
+        """Durable-row probe by ``message_uid`` (one statement, any uid count): which of *uids* already
+        exist as ACTIVE rows in *session_id*.
+
+        The flush path's in-memory guards (``_DB_PERSISTED_MARKER`` + object identity) live on the dict
+        instances the live process holds. A dict rebuilt from durable rows — a crash/failed-turn history
+        restore, a resumed session, a repaired sequence — carries its durable ``message_uid`` (identity
+        restoration) but neither the marker nor ``_row_id``, so the append-only flush treats it as new
+        and INSERTs a second copy of an already-durable logical message. Production receipts (estate
+        state.db, 2026-10): 24k+ re-inserted shadow rows across 47 sessions, each preserving the original
+        uid while losing display metadata — the exact signature of this path. Consulting the durable
+        uid set before insert closes it: same uid already active = same logical message, stamp and skip.
+
+        Returns a mapping uid -> exists; an empty input returns ``{}`` without touching SQLite.
+        """
+        uids = [u for u in (uids or []) if isinstance(u, str) and u]
+        if not uids:
+            return {}
+        placeholders = ", ".join("?" for _ in uids)
+        rows = self._read_all(
+            f"SELECT DISTINCT message_uid FROM messages "
+            f"WHERE session_id = ? AND active = 1 AND message_uid IN ({placeholders})",
+            (session_id, *uids))
+        found = {row["message_uid"] for row in rows}
+        return {uid: (uid in found) for uid in uids}
+
     def _is_explicit_fork_child_row(self, session: Dict[str, Any], *, include_reset: bool = False) -> bool:
         """True when *session* is a branch, delegate, or tool child of its parent (``include_reset``: also a
         reset fork). Markers only count when they point at ``parent_session_id``: compression copies
