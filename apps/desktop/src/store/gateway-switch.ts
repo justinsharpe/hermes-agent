@@ -7,7 +7,7 @@ import { clearArtifactRegistry } from '@/store/artifacts'
 import { invalidateCronJobsRequests, setCronJobs } from '@/store/cron'
 import { resetSessionsLimit } from '@/store/layout'
 import { resetLiveSync } from '@/store/live-sync'
-import { invalidateProfileListFetches } from '@/store/profile'
+import { invalidateProfileListFetches, $showAllProfiles } from '@/store/profile'
 import { exitProjectScope } from '@/store/project-scope'
 import {
   $unreadFinishedSessionIds,
@@ -98,7 +98,12 @@ export function beginGatewaySwitch(): GatewaySwitchToken {
   try {
     switchLifecycle?.beforeConnectionSwitch()
     wipeStarted = true
-    wipeSessionListsForGatewaySwitch()
+    // L4 fix 5: a switch committed from the unified all-profiles scope keeps
+    // the row lists (the sidebar is a filter over every source, not a view of
+    // one); every other scope keeps the legacy full wipe. Read at commit time:
+    // selectConnection collapses the scope AFTER the switch lands, so the
+    // commit-time value is the scope the user was looking at when they clicked.
+    wipeSessionListsForGatewaySwitch({ preserveSessionLists: $showAllProfiles.get() })
 
     return token
   } catch (error) {
@@ -182,8 +187,24 @@ export function recoverActiveSourceAfterFailedGatewaySwitch(token: GatewaySwitch
  * Does NOT call requestFreshSession() — that navigates to NEW_CHAT and would
  * close route overlays (Settings). Clear chat state in place; leave the URL
  * alone so the user stays where they were (e.g. mid-Gateway settings).
+ *
+ * L4 fix 5 (L4-desktop-unified-inbox.md §5 bullet 5, M2): with
+ * `preserveSessionLists` the previous source's session ROWS stay in memory —
+ * in the unified all-profiles view a gateway switch is a filter change, not a
+ * data change, so the sidebar keeps painting every source's conversations
+ * while the refresh reconciles by the same (profile, id) identity
+ * mergeSessionPage already uses. Only the row lists and their per-profile
+ * meta are preserved; every runtime-id-bound binding (states, todos,
+ * transcript tails, cwd, artifacts) is still severed exactly as before.
+ * Callers opt in ONLY from the unified scope ($showAllProfiles at commit
+ * time), so a scoped switch and the single-connection case keep the legacy
+ * wipe byte-for-byte (upstream constraint).
  */
-export function wipeSessionListsForGatewaySwitch(): void {
+export interface WipeSessionListsOptions {
+  preserveSessionLists?: boolean
+}
+
+export function wipeSessionListsForGatewaySwitch(options: WipeSessionListsOptions = {}): void {
   // The next backend is a different runtime — don't carry the old one's
   // "batched sidebar endpoint missing" capability verdict across the switch.
   resetSidebarBatchCapability()
@@ -200,16 +221,27 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // Project ids belong to the outgoing backend's projects.db; a scope left
   // entered would root the next draft's cwd in the old source's project.
   exitProjectScope()
-  setSessions([])
-  setSessionProfilesTruncated({})
-  setSessionProfilesUsage({})
-  setCronSessions([])
-  invalidateCronJobsRequests()
-  setCronJobs([])
-  setMessagingSessions([])
-  setMessagingListServer(null)
-  setMessagingPlatformTotals({})
-  setMessagingTruncated(false)
+  // L4 fix 5: the ROW lists (recents + per-profile meta) are the only stores
+  // preserved in the unified view. Every entry below that stays runtime-id
+  // bound is still wiped — the identity of a preserved row is (profile, id)
+  // + connection tag, which the refresh merge reconciles by owner.
+  const preserveRows = options.preserveSessionLists === true
+  if (!preserveRows) {
+    setSessions([])
+    setSessionProfilesTruncated({})
+    setSessionProfilesUsage({})
+    setCronSessions([])
+    invalidateCronJobsRequests()
+    setCronJobs([])
+    setMessagingSessions([])
+    setMessagingListServer(null)
+    setMessagingPlatformTotals({})
+    setMessagingTruncated(false)
+  } else {
+    // A preserved list still must not keep stale per-slice flags from the
+    // outgoing source; the refresh re-derives them per scope.
+    invalidateCronJobsRequests()
+  }
   // Clearing $sessionStates automatically clears $workingSessionIds and
   // $attentionSessionIds (computed) and $stalledSessionIds (owned beside it).
   // $unreadFinishedSessionIds is separate, so wipe it explicitly. Only the
@@ -227,6 +259,9 @@ export function wipeSessionListsForGatewaySwitch(): void {
   resetLiveRuntimeTracking()
   resetLiveSync()
   $unreadFinishedSessionIds.set([])
+  // L4 fix 5: a preserved list still arms the skeleton merge — refreshSessions
+  // overlays fresh rows over the kept ones by (profile, id), and the loading
+  // flag keeps the transition visible without an empty flash first.
   setSessionsLoading(true)
   setSessionsLoadError(false)
   resetSessionsLimit()
