@@ -10,9 +10,11 @@ import {
   persistBoolean,
   persistStringArray,
   persistStringRecord,
+  readKey,
   storedBoolean,
   storedStringArray,
-  storedStringRecord
+  storedStringRecord,
+  writeKey
 } from '@/lib/storage'
 import { withTimeout } from '@/lib/with-timeout'
 import { registryConnectionKind } from '@/store/connection-registry-state'
@@ -937,11 +939,55 @@ export const messagingTotalsKey = (messagingProfile: string, sourceId: string): 
 
 const SHOW_ALL_PROFILES_STORAGE_KEY = 'hermes.desktop.showAllProfiles'
 
+// L4 unified-inbox fix 3 (L4-desktop-unified-inbox.md §5 bullet 3, M1): with
+// a MULTI-connection registry the unified all-profiles view is the DEFAULT
+// scope — a fleet user's sidebar should show every source's conversations,
+// not an opt-in behind a filter-menu toggle. The persisted preference, once
+// the user has expressed one (non-null), still wins over the default. A
+// single-connection registry keeps the legacy default (false): those users
+// never see the switcher and their scope stays tied to the live gateway
+// profile, byte-identical to before (upstream constraint).
+const UNIFIED_INBOX_STORAGE_KEY = 'hermes.desktop.unifiedInboxEnabled'
+
 // Opt-in unified view. When false, scope follows the live gateway profile, so
 // single-profile users (who never see the switcher) are completely unaffected.
 export const $showAllProfiles = atom<boolean>(storedBoolean(SHOW_ALL_PROFILES_STORAGE_KEY, false))
 
 $showAllProfiles.subscribe(value => persistBoolean(SHOW_ALL_PROFILES_STORAGE_KEY, value))
+
+/** Whether unified-inbox-by-default is enabled (L4 fix 3). Tri-state on disk:
+ *  null = never expressed → multi-connection registries default the unified
+ *  view on; true/false = explicit opt-in/opt-out that always wins. Exported so
+ *  Settings can render the toggle and tests can pin the tri-state. */
+export function storedUnifiedInboxPreference(): null | boolean {
+  const raw = readKey(UNIFIED_INBOX_STORAGE_KEY)
+
+  return raw === null ? null : raw === 'true'
+}
+
+export function setUnifiedInboxPreference(value: null | boolean): void {
+  writeKey(UNIFIED_INBOX_STORAGE_KEY, value === null ? null : String(value))
+}
+
+/**
+ * L4 fix 3: apply the unified-default to $showAllProfiles. Idempotent; runs
+ * when the registry is (re)published to the renderer. Only EVER flips the
+ * atom when the user has not expressed a preference AND the registry holds
+ * multiple connections — every other combination is left untouched, so a
+ * single-connection registry and an explicit user choice both keep exactly
+ * the scope they had.
+ */
+export function applyUnifiedInboxDefault(connectionCount: number): void {
+  if (storedUnifiedInboxPreference() !== null) {
+    return
+  }
+
+  const multi = connectionCount > 1
+
+  if (multi && !$showAllProfiles.get()) {
+    setShowAllProfiles(true)
+  }
+}
 
 // The profile context the sidebar is currently showing: a concrete profile key,
 // or ALL_PROFILES for the unified grouped view. Concrete scope is tied to the

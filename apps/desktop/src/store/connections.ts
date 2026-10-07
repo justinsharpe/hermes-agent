@@ -23,6 +23,7 @@ import {
   $freshSessionRequest,
   $newChatProfile,
   $showAllProfiles,
+  applyUnifiedInboxDefault,
   captureNewChatSource,
   ensureGatewayAgent,
   normalizeProfileKey,
@@ -128,6 +129,10 @@ export function _resetConnectionsForTests(): void {
 
 export function setConnectionsRegistry(registry: DesktopConnectionsRegistry): void {
   $connectionsRegistry.set(registry)
+  // L4 fix 3: a multi-connection registry defaults the sidebar to the unified
+  // all-profiles view — unless the user has an explicit scope preference.
+  // Idempotent; single-connection registries are a no-op (upstream constraint).
+  applyUnifiedInboxDefault(registry.connections.length)
 }
 
 /** Refresh the renderer cache from Electron's local registry. No backend is contacted. */

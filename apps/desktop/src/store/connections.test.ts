@@ -74,6 +74,7 @@ vi.mock('@/store/profile', () => ({
   $freshSessionRequest,
   $newChatProfile,
   $showAllProfiles,
+  applyUnifiedInboxDefault: vi.fn(),
   captureNewChatSource: vi.fn(),
   ensureGatewayAgent,
   normalizeProfileKey: (name: null | string | undefined) => (name ?? '').trim() || 'default',
@@ -1013,5 +1014,16 @@ describe('selectConnection', () => {
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
     expect(wipeSessionListsForGatewaySwitch).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
+  })
+})
+
+describe('setConnectionsRegistry unified-inbox default (L4 fix 3)', () => {
+  it('publishing a multi-connection registry applies the unified-inbox default', async () => {
+    const profile = (await import('./profile')) as unknown as {
+      applyUnifiedInboxDefault: ReturnType<typeof vi.fn>
+    }
+    setConnectionsRegistry(registry)
+
+    expect(profile.applyUnifiedInboxDefault).toHaveBeenCalledWith(3)
   })
 })
