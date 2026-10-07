@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import type { FederatedSessionIndex } from './federated-session-index'
 import {
   FederatedSessionIndexStore,
   FEDERATED_SESSION_INDEX_VERSION,
@@ -30,7 +31,7 @@ function row(overrides: Partial<Record<string, unknown>> = {}) {
 }
 
 function emptyIndex() {
-  return { version: FEDERATED_SESSION_INDEX_VERSION as const, owners: {} }
+  return { version: 1 as const, owners: {} }
 }
 
 describe('parseSessionIndex', () => {
@@ -134,8 +135,8 @@ describe('pruneSessionIndex', () => {
 
 describe('indexedSessionRows', () => {
   it('flattens every owner, newest-first', () => {
-    const index = {
-      version: FEDERATED_SESSION_INDEX_VERSION,
+    const index: FederatedSessionIndex = {
+      version: 1,
       owners: {
         'a::default': [row({ id: 'old-a', last_active: 5, started_at: 5 })],
         'b::default': [row({ id: 'new-b', connection_id: 'b', last_active: 9, started_at: 9 })]

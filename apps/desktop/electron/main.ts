@@ -205,6 +205,8 @@ import {
 } from './connection-registry'
 import type { RegistryConnection } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
+import { FederatedSessionIndexStore, type FederatedSessionIndex } from './federated-session-index'
+import { RegistrySessionEnumerator } from './registry-session-enumerator'
 import { liveWindowState, overlayWindowState } from './connection-window-state'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken, isAttachedBackendTokenDrifted, resolveServedDashboardToken } from './dashboard-token'
@@ -9279,6 +9281,52 @@ function readDesktopConnectionsRegistry() {
   return registry
 }
 
+// ── Federated session index + background enumeration (L4 fixes 1 & 2) ──────
+// The unified Sessions list is read-time-only: cold/unreachable instances
+// contribute zero rows and every switch re-reads everything. The index
+// (L4 fix 1) remembers owner-tagged rows across refreshes; the enumerator
+// (L4 fix 2) keeps it fresh for registry connections without a warm pooled
+// backend. Both are inert for single-connection registries (upstream
+// constraint: single-connection behavior identical).
+const federatedSessionIndex = new FederatedSessionIndexStore(app.getPath('userData'))
+
+/** One registry connection's cross-profile session rows, dialing with
+ *  BACKGROUND priority when no backend is pooled — the one lane where the
+ *  sidebar's 'never dial' rule is relaxed, per L4 fix 2. Bounded by the
+ *  enumerator's own schedule; never called from a request path. */
+async function fetchRegistrySessionsForEnumeration(connectionId: string): Promise<{ sessions: unknown[] } | null> {
+  try {
+    const connection = await ensureRegistryBackend(connectionId, 'default', '', { spawnPriority: 'background' })
+    // Shared remote/cloud hosts serve every profile via ?profile=; one
+    // cross-profile read covers the connection. Reads omit include_hidden so
+    // Bot Mode's hidden canonical chats stay out (same rule as the merge).
+    const data = await getJsonForBackend(connection, `/api/profiles/sessions?profile=all&limit=100&order=recent&archived=exclude`, {
+      timeoutMs: 10_000
+    })
+    const sessions = Array.isArray((data as { sessions?: unknown })?.sessions) ? (data as { sessions: unknown[] }).sessions : []
+    // tagRegistrySessionResponse stamps provenance so the index rows open
+    // through the owning gateway exactly like live unified rows.
+    tagRegistrySessionResponse('/api/profiles/sessions', data, connectionId)
+
+    return { sessions }
+  } catch {
+    // Dead host, auth failure, dial timeout — a pass is best-effort.
+    return null
+  }
+}
+
+const registrySessionEnumerator = new RegistrySessionEnumerator({
+  connections: () =>
+    readDesktopConnectionsRegistry().connections.map(connection => ({
+      connectionId: connection.id,
+      kind: connection.kind
+    })),
+  fetchSessions: fetchRegistrySessionsForEnumeration,
+  remember: (connectionId, sessions) => federatedSessionIndex.remember(connectionId, sessions as FederatedSessionIndex['owners'][string][number][]),
+  schedule: (fn, ms) => setTimeout(fn, ms),
+  cancel: handle => clearTimeout(handle as ReturnType<typeof setTimeout>)
+})
+
 // Copy an unparseable connections.json aside (once per corruption event) so a
 // later registry write can never destroy the only copy of the user's saved
 // connections (#94246). Best effort: failure to preserve must not block boot.
@@ -17493,6 +17541,29 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles, registry
     total += added
   }
 
+  // L4 fix 1 (federated index): backfill rows from registry connections that
+  // are NOT currently readable — a cold SSH box still shows its history from
+  // the persistent index instead of contributing nothing (M3's amnesia). The
+  // live rows above always win; spliceRegistrySessionRows dedupes by
+  // (profile, id) so a source that IS readable never doubles up. Inert for
+  // single-connection registries (no non-local sources → nothing indexed).
+  const pooledIds = new Set(registrySources.map(source => source.connectionId))
+  const registryConnections = readDesktopConnectionsRegistry().connections
+  const coldConnections = registryConnections.filter(
+    connection => connection.kind !== 'local' && !pooledIds.has(connection.id)
+  )
+
+  if (coldConnections.length) {
+    const indexedRows = federatedSessionIndex.rows()
+    const coldIds = new Set(coldConnections.map(connection => connection.id))
+    const coldRows = indexedRows.filter(row => coldIds.has(String(row?.connection_id)))
+
+    if (coldRows.length) {
+      const { added } = spliceRegistrySessionRows(merged, coldRows, profileTotals)
+      total += added
+    }
+  }
+
   const recency = s => s?.[order] ?? s?.started_at ?? 0
   merged.sort((a, b) => recency(b) - recency(a))
 
@@ -18187,6 +18258,10 @@ app.on('before-quit', () => {
     translucencyWriteTimer = null
     writePersistedTranslucency(translucencyState)
   }
+
+  // L4 fix 2: stop the background enumeration so a quit never leaves a pass
+  // mid-dial (the enumerator cancels its timers and drains its queue).
+  registrySessionEnumerator.stop()
 })
 
 // Close the pooled keep-alive sockets on quit so lingering connections can't
@@ -19332,6 +19407,11 @@ app.whenReady().then(() => {
   void minimizeToTray.start()
   mainProcessLagWatchdog.start()
   f12Blocked = readPersistedDisableF12()
+  // L4 fix 2: start the bounded background enumeration for multi-connection
+  // registries (the enumerator itself skips single-connection fleets). Keeps
+  // the federated session index fresh for connections without warm pooled
+  // backends; torn down on before-quit below.
+  registrySessionEnumerator.start()
   // Seed this before the first window exists: a picker can open before
   // startHermes() finishes resolving the configured backend.
   const primaryProfile = primaryProfileKey()
