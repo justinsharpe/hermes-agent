@@ -84,29 +84,41 @@ jobs:
           import psutil
           print(f"probe psutil: {psutil.__version__}")
           import hermes_constants_scratch as scratch
-          tmp = Path(tempfile.mkdtemp(prefix="reapprobe-"))
-          scratch_root = tmp / "scratch"
-          entry = scratch_root / "lane"
-          entry.mkdir(parents=True)
-          ancient = time.time() - 48 * 3600
-          os.utime(entry, (ancient, ancient))
-          child = subprocess.Popen(
-              [sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(entry),
-              stdin=subprocess.DEVNULL,
-          )
-          logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True)
-          before = child.poll()
-          try:
-              removed = scratch.prune_idle_entries(scratch_root, 24, frozenset())
-              after = child.poll()
-              time.sleep(1.0)  # give Windows handle release a beat
-              print(f"probe: removed={removed} child_before={before} child_after={after}")
-              print(f"probe: entry_exists_after_1s_wait={entry.exists()}")
-              if removed != 1:
-                  # The reaper's own records explain why: dump what the prune emitted.
-                  print(f"probe: entry still present at end: {entry.exists()}")
-          finally:
-              if child.poll() is None:
-                  child.kill()
-              child.wait(timeout=10)
+          # tempfile on the runner returns an 8.3 short-form root (RUNNER~1). Build the
+          # entry under a long-form root too, so the probe can compare both forms —
+          # the reaper's _under() is a string prefix match, and realpath does not
+          # expand 8.3 short names.
+          short_tmp = Path(tempfile.mkdtemp(prefix="reapprobe-"))
+          long_tmp = Path(tempfile.gettempdir()) / ("reapprobe-long-" + os.urandom(4).hex())
+          long_tmp.mkdir()
+          for label, base in (("short-form", short_tmp), ("long-form", long_tmp)):
+              scratch_root = base / "scratch"
+              entry = scratch_root / "lane"
+              entry.mkdir(parents=True)
+              ancient = time.time() - 48 * 3600
+              os.utime(entry, (ancient, ancient))
+              child = subprocess.Popen(
+                  [sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(entry),
+                  stdin=subprocess.DEVNULL,
+              )
+              logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True)
+              before = child.poll()
+              try:
+                  pre_cwd = psutil.Process(child.pid).cwd()
+              except Exception as exc:
+                  pre_cwd = f"<unavailable: {exc!r}>"
+              try:
+                  removed = scratch.prune_idle_entries(scratch_root, 24, frozenset())
+                  after = child.poll()
+                  time.sleep(1.0)  # give Windows handle release a beat
+                  print(f"probe[{label}]: base={base}")
+                  print(f"probe[{label}]: child_cwd_via_psutil={pre_cwd!r}")
+                  print(f"probe[{label}]: removed={removed} child_before={before} child_after={after}")
+                  print(f"probe[{label}]: entry_exists_after_1s_wait={entry.exists()}")
+                  print(f"probe[{label}]: realpath_root={os.path.realpath(str(scratch_root))!r}")
+                  print(f"probe[{label}]: realpath_entry={os.path.realpath(str(entry))!r}")
+              finally:
+                  if child.poll() is None:
+                      child.kill()
+                  child.wait(timeout=10)
           PY
