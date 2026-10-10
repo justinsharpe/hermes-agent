@@ -16,7 +16,7 @@ jobs:
       - name: Checkout the PR head
         uses: actions/checkout@v4
         with:
-          ref: feat/scratch-prune-f1-rescue
+          ref: main
           fetch-depth: 0
 
       - name: Show the head under test
