@@ -17,6 +17,9 @@ name: scratch-rescue windows verify
 # The bare leg reproduces the old failure environment; the psutil leg answers the reviewer's
 # question: with psutil provably importable, does the reap run (TERM/reaped lines present) and
 # the deletion still leave residue (post-reap handle timing), or does the picture change?
+# NOTE: the `bare` leg is the CONTROL — it is EXPECTED to fail (no psutil -> reaper skips ->
+# assert 0 == 1). Do not fix it; `continue-on-error` above only keeps its red out of the RUN
+# verdict while leaving it visible in the job list.
 # NOTE (workflow security): this workflow references no untrusted input — fixed ref, matrix
 # constants, literal commands only.
 
@@ -29,6 +32,7 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 25
+    continue-on-error: ${{ matrix.leg == 'bare' }}
     strategy:
       fail-fast: false
       matrix:
