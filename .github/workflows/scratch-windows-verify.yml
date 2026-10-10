@@ -1,6 +1,6 @@
 name: scratch-rescue windows verify
 
-# Purpose: run PR #134173's own scratch suites on a real Windows host — the one platform the local
+# Purpose: run PR #134173's own scratch suites on a real Windows host — the platform the local
 # verification (macOS + Linux) could not cover. Side branch only; the PR head is untouched.
 
 on:
@@ -16,7 +16,7 @@ jobs:
       - name: Checkout the PR head
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: feat/scratch-prune-f1-rescue
           fetch-depth: 0
 
       - name: Show the head under test
