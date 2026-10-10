@@ -469,58 +469,106 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
-def test_respawn_guard_rate_limit_requeue_survives_a_later_reclaim(
+def test_respawn_guard_recognizes_rate_limit_stamp_after_reclaimed_run(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit requeue stamp must survive a LATER non-outcome run.
-
-    Regression (2026-10-10; observed live on 3 ascension cards: t_3dae7447,
-    t_8c30ba34, t_79f8bad5): the rate-limit requeue writes the quota-flavored
-    ``last_failure_error`` but counts NO failure and records a ``rate_limited``
-    run. A *later* run row then lands with outcome ``reclaimed`` (the reclaim
-    pass) and becomes the guard's ``latest_run`` — the rate-limit exemption keys
-    on the LATEST run outcome only, so it missed and the stamped "quota" text
-    fell through to ``blocker_auth``, parking the card FOREVER
-    (``respawn_guarded{blocker_auth}`` every tick).
+    """A rate-limit requeue stamps ``last_failure_error`` with the quota-wall
+    marker but never increments ``consecutive_failures``; a later ``reclaimed``
+    run row (orphaned-running sweep bookkeeping) supersedes it as the guard's
+    ``latest_run``, so the existing rate-limit exemption missed and the guard
+    trapped the card in ``blocker_auth`` forever. The stamp IS the durable
+    witness to the original quota wall — the guard must honor it for any
+    non-crashed latest outcome (#t_944174bb).
     """
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
     now = 5_000_000
+    stamp = "pid 1 exited rate-limited (quota wall) — requeued without counting a failure"
 
-    with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="rl-requeue-then-reclaim", assignee="a")
+    def _seed(conn, title):
+        tid = kb.create_task(conn, title=title, assignee="a")
         kb.claim_task(conn, tid)
-        run1 = kb.get_task(conn, tid).current_run_id
-        # 1) The rate-limit requeue: a rate_limited run + the stamped error.
+        rl_run = kb.get_task(conn, tid).current_run_id
         conn.execute(
             "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
             "ended_at=? WHERE id=?",
-            (now, run1),
+            (now - 1000, rl_run),
         )
         conn.execute(
-            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
-            ("pid 1 exited rate-limited (quota wall) — requeued without counting "
-             "a failure", tid),
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            (stamp, tid),
         )
-        # 2) A LATER run that was reclaimed (a non-outcome) — the new latest_run.
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
-            "VALUES (?, 'released', ?, ?, 'reclaimed')",
-            (tid, now + 200, now + 260),
+        return tid
+
+    # Case 1: rate_limited → reclaimed, inside cooldown → rate_limit_cooldown.
+    with kbc.connect() as conn:
+        tid = _seed(conn, "rl-then-reclaimed")
+        # A LATER reclaimed run (orphaned-running sweep bookkeeping) lands.
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, "
+            "worker_pid, claim_lock) VALUES (?, 'reclaimed', 'reclaimed', ?, ?, NULL, NULL)",
+            (tid, now, now),
         )
+        rec_run = cur.lastrowid
         conn.commit()
 
-        # Inside the cooldown relative to the rate_limited run → the rate-limit
-        # reason, NEVER blocker_auth.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
         assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
 
-        # Past the cooldown → allowed (None). This is the assertion that was RED
-        # before the fix (the guard returned "blocker_auth" and parked the card).
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
         assert kbd.check_respawn_guard(conn, tid) is None
+
+    # Case 2: cooldown disabled → straight through, no blocker_auth.
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    with kbc.connect() as conn:
+        tid = _seed(conn, "rl-then-reclaimed-no-cd")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, "
+            "worker_pid, claim_lock) VALUES (?, 'reclaimed', 'reclaimed', ?, ?, NULL, NULL)",
+            (tid, now, now),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+    # Case 3: a *crashed* latest run with the stamp is not a guard reason —
+    # a crash's persisted error is treated as worker-context, not a diagnosis
+    # (see docstring: "may contain benign commands such as ``claude auth
+    # status``"). The crash itself is the breaker; the guard returns None.
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    with kbc.connect() as conn:
+        tid = _seed(conn, "rl-then-reclaimed-then-crash")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, "
+            "worker_pid, claim_lock) VALUES (?, 'failed', 'crashed', ?, ?, NULL, NULL)",
+            (tid, now, now + 50),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+    # Case 4: non-crashed latest outcome + a NON-stamp quota error → still
+    # blocker_auth (the stamp exemption must not generalize to every
+    # "quota"-mentioning error). The new branch is the ONLY new path; the
+    # rest of the guard is unchanged.
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="genuine-quota-blocker", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='spawn_failed', status='failed', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("provider rejected: quota exhausted for this account", tid),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
 
 
 @pytest.mark.parametrize(
