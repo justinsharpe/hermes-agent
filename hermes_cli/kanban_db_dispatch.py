@@ -79,6 +79,14 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# The rate-limit requeue writes a quota-flavored ``last_failure_error`` but
+# counts NO failure (see the ``rate_limited`` ``_DeadWorker``). The guard must
+# recognize THIS exact marker even when a LATER non-outcome run (reclaimed /
+# released) supersedes the ``rate_limited`` run row — which defeats the
+# latest-run rate-limit exemption and otherwise parks the card in
+# ``blocker_auth`` forever (regression 2026-10-10, 3 ascension cards).
+RATE_LIMIT_REQUEUE_MARKER = "requeued without counting a failure"
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -1319,7 +1327,7 @@ def _classify_dead_worker_exit(
         # NOT count a failure so a long quota window can't trip the breaker.
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+            f"pid {pid} exited rate-limited (quota wall) — {RATE_LIMIT_REQUEUE_MARKER}",
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
@@ -1808,6 +1816,27 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
+
+    # 2a. Rate-limit requeue stamp must survive a LATER non-outcome run
+    #     (regression 2026-10-10). The requeue counts NO failure, but a later
+    #     ``reclaimed``/``released`` run row becomes ``latest_run`` and defeats
+    #     the latest-run rate-limit exemption (branch 1) — the stamped quota
+    #     text then parks the card in ``blocker_auth`` forever. Honor the
+    #     explicit marker with the same cooldown; a genuine later crash still
+    #     supersedes (``latest_outcome != "crashed"`` guard).
+    if err and latest_outcome != "crashed" and RATE_LIMIT_REQUEUE_MARKER in err:
+        if rl_cooldown > 0:
+            rl_run = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE task_id = ? "
+                "AND outcome = 'rate_limited' AND ended_at IS NOT NULL "
+                "ORDER BY ended_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if rl_run is not None and rl_run["ended_at"] is not None \
+                    and (now - int(rl_run["ended_at"])) < rl_cooldown:
+                return "rate_limit_cooldown"
+        return None
+
     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 

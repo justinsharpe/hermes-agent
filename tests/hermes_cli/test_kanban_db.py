@@ -469,6 +469,60 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_rate_limit_requeue_survives_a_later_reclaim(
+    kanban_home, monkeypatch,
+):
+    """A rate-limit requeue stamp must survive a LATER non-outcome run.
+
+    Regression (2026-10-10; observed live on 3 ascension cards: t_3dae7447,
+    t_8c30ba34, t_79f8bad5): the rate-limit requeue writes the quota-flavored
+    ``last_failure_error`` but counts NO failure and records a ``rate_limited``
+    run. A *later* run row then lands with outcome ``reclaimed`` (the reclaim
+    pass) and becomes the guard's ``latest_run`` — the rate-limit exemption keys
+    on the LATEST run outcome only, so it missed and the stamped "quota" text
+    fell through to ``blocker_auth``, parking the card FOREVER
+    (``respawn_guarded{blocker_auth}`` every tick).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rl-requeue-then-reclaim", assignee="a")
+        kb.claim_task(conn, tid)
+        run1 = kb.get_task(conn, tid).current_run_id
+        # 1) The rate-limit requeue: a rate_limited run + the stamped error.
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run1),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued without counting "
+             "a failure", tid),
+        )
+        # 2) A LATER run that was reclaimed (a non-outcome) — the new latest_run.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
+            "VALUES (?, 'released', ?, ?, 'reclaimed')",
+            (tid, now + 200, now + 260),
+        )
+        conn.commit()
+
+        # Inside the cooldown relative to the rate_limited run → the rate-limit
+        # reason, NEVER blocker_auth.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        # Past the cooldown → allowed (None). This is the assertion that was RED
+        # before the fix (the guard returned "blocker_auth" and parked the card).
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
