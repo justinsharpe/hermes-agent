@@ -27,8 +27,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install pytest
-        run: python -m pip install --quiet --disable-pip-version-check pytest
+      - name: Install test deps (pytest + the config layer the suite imports)
+        run: python -m pip install --quiet --disable-pip-version-check pytest ruamel.yaml
 
       - name: Run the scratch suites (the PR's own tests) on Windows
         run: python -m pytest tests/test_scratch_dir.py tests/test_scratch_scan_failures.py -v
