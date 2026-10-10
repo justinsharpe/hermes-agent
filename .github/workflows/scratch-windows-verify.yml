@@ -3,6 +3,23 @@ name: scratch-rescue windows verify
 # Purpose: run PR #134173's own scratch suites on a real Windows host — the platform the local
 # verification (macOS + Linux) could not cover. Side branch only; the PR head is untouched.
 
+# 2026-10-10 rerun (andrexibiza's evidence correction on #134173): the previous Windows run
+# could not distinguish "reap skipped (psutil not installed)" from "reap ran, Windows handle
+# timing left the directory held" because it installed only pytest + ruamel.yaml on Python 3.11
+# and recorded no psutil import receipt. This rerun is dependency-correct per the head's own
+# pyproject.toml: Python 3.14 (the supported runtime), the pinned psutil==7.2.2, an explicit
+# import receipt, and the reaper's DEBUG/TERM/reaped lines exposed in the test log, plus a
+# native reap probe. Two legs on the same head:
+#
+#   bare    — pytest + ruamel.yaml only: reproduces the previous environment for comparison
+#   psutil  — adds the head's pinned psutil==7.2.2: the dependency-correct environment
+#
+# The bare leg reproduces the old failure environment; the psutil leg answers the reviewer's
+# question: with psutil provably importable, does the reap run (TERM/reaped lines present) and
+# the deletion still leave residue (post-reap handle timing), or does the picture change?
+# NOTE (workflow security): this workflow references no untrusted input — fixed ref, matrix
+# constants, literal commands only.
+
 on:
   workflow_dispatch:
   push:
@@ -12,23 +29,84 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [ bare, psutil ]
     steps:
       - name: Checkout the PR head
         uses: actions/checkout@v4
         with:
+          # Fixed branch ref from this fork only — no pull_request event inputs involved.
           ref: feat/scratch-prune-f1-rescue
           fetch-depth: 0
 
-      - name: Show the head under test
+      - name: Show the under-test head
         run: git log -1 --format='%H %s'
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.14
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
       - name: Install test deps (pytest + the config layer the suite imports)
         run: python -m pip install --quiet --disable-pip-version-check pytest ruamel.yaml
 
+      - name: Install the head's pinned psutil (psutil leg only)
+        if: matrix.leg == 'psutil'
+        run: python -m pip install --quiet --disable-pip-version-check psutil==7.2.2
+
+      - name: Record dependency state before the suite
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sys
+          print(f"python: {sys.version}")
+          try:
+              import psutil
+              print(f"psutil: {psutil.__version__} (import succeeded)")
+          except Exception as exc:
+              print(f"psutil: IMPORT FAILED: {exc!r}")
+          PY
+
       - name: Run the scratch suites (the PR's own tests) on Windows
-        run: python -m pytest tests/test_scratch_dir.py tests/test_scratch_scan_failures.py -v
+        run: >-
+          python -m pytest tests/test_scratch_dir.py tests/test_scratch_scan_failures.py -v
+          --log-cli-level=DEBUG --log-cli-format='%(levelname)s %(name)s:%(lineno)d %(message)s'
+
+      - name: Native reap probe (psutil leg only — does the reaper fire natively?)
+        if: matrix.leg == 'psutil'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import logging, os, subprocess, sys, tempfile, time
+          from pathlib import Path
+          import psutil
+          print(f"probe psutil: {psutil.__version__}")
+          import hermes_constants_scratch as scratch
+          tmp = Path(tempfile.mkdtemp(prefix="reapprobe-"))
+          scratch_root = tmp / "scratch"
+          entry = scratch_root / "lane"
+          entry.mkdir(parents=True)
+          ancient = time.time() - 48 * 3600
+          os.utime(entry, (ancient, ancient))
+          child = subprocess.Popen(
+              [sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(entry),
+              stdin=subprocess.DEVNULL,
+          )
+          logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True)
+          before = child.poll()
+          try:
+              removed = scratch.prune_idle_entries(scratch_root, 24, frozenset())
+              after = child.poll()
+              time.sleep(1.0)  # give Windows handle release a beat
+              print(f"probe: removed={removed} child_before={before} child_after={after}")
+              print(f"probe: entry_exists_after_1s_wait={entry.exists()}")
+              if removed != 1:
+                  # The reaper's own records explain why: dump what the prune emitted.
+                  print(f"probe: entry still present at end: {entry.exists()}")
+          finally:
+              if child.poll() is None:
+                  child.kill()
+              child.wait(timeout=10)
+          PY
