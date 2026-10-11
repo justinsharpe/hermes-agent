@@ -446,6 +446,21 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_kanban_burn_breaker(request, monkeypatch):
+    """Disable the dispatcher's burn-breaker latch for every test.
+
+    The latch reads an operator-owned cost-breaker state file (default under
+    the real home). Left live, dispatch tests would stop spawning whenever the
+    operator's breaker happens to be tripped. Tests of the latch itself opt
+    out with ``@pytest.mark.real_burn_breaker`` and point
+    ``HERMES_BURN_BREAKER_STATE`` at a tmp file.
+    """
+    if request.node.get_closest_marker("real_burn_breaker"):
+        return
+    monkeypatch.setenv("HERMES_BURN_BREAKER_STATE", "off")
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
 
@@ -1101,6 +1116,9 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "allow_real_home_io: explicitly bypass the test-only home I/O guard."
+    )
+    config.addinivalue_line(
+        "markers", "real_burn_breaker: keep the kanban dispatcher's burn-breaker latch live."
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."

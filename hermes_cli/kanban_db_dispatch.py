@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -169,6 +170,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    burn_breaker_latched: bool = False
+    """True when the external burn circuit breaker's state file reported
+    ``tripped: true`` this tick: no new workers were spawned (deferred, not
+    dropped). See :func:`burn_breaker_latched`."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -183,6 +188,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    latched = False
     for res in results:
         if res is None:
             continue
@@ -194,9 +200,13 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if getattr(res, "burn_breaker_latched", False):
+            latched = True
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    if latched:
+        parts.append("burn_breaker_latched")
     return ", ".join(parts)
 
 
@@ -2488,6 +2498,128 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
+# Burn-breaker spawn latch (t_8973af47). An external cost circuit breaker
+# latches by writing ``{"tripped": true}`` to a JSON state file and SIGTERMs
+# running workers. Without this check the dispatcher kept claiming ready cards
+# and spawning workers the breaker killed minutes later (3 days of churn).
+# While latched, ``_tick_spawn_budget`` spawns nothing; reclaim/promotion
+# bookkeeping still runs and ready cards stay queued.
+#
+# FAIL-OPEN by contract: a missing, unreadable, malformed or non-object state
+# file is treated as NOT latched (plus one WARNING per path+fault) — a broken
+# breaker file must never freeze the roster. CHEAP: the file is re-parsed only
+# when its ``stat`` signature (mtime_ns, size, inode) changes.
+#
+# Path precedence: ``HERMES_BURN_BREAKER_STATE`` env > config
+# ``kanban.burn_breaker_state_file`` > ``~/viiy-hq/personal/context-sync/costs/
+# burn-breaker-state.json``. ``off``/``none``/``disabled``/``false``/``0``
+# (or an empty value) disables the check entirely.
+BURN_BREAKER_STATE_ENV = "HERMES_BURN_BREAKER_STATE"
+BURN_BREAKER_STATE_CONFIG_KEY = "burn_breaker_state_file"
+_BURN_BREAKER_DEFAULT_PARTS = (
+    "viiy-hq", "personal", "context-sync", "costs", "burn-breaker-state.json",
+)
+_BURN_BREAKER_DISABLED_VALUES = frozenset({"", "off", "none", "disabled", "false", "0"})
+# Re-warn cadence while latched, so a multi-day latch stays visible in the log
+# without a WARNING on every tick.
+_BURN_BREAKER_LATCHED_REWARN_SECONDS = 900.0
+
+# path-str -> (stat signature | None, latched)
+_burn_breaker_cache: "dict[str, tuple[Optional[tuple[int, int, int]], bool]]" = {}
+# (path-str, fault) pairs already warned about; cleared on a clean read.
+_burn_breaker_warned: "set[tuple[str, str]]" = set()
+_burn_breaker_last_latched_warn: "dict[str, float]" = {}
+
+
+def _reset_burn_breaker_cache() -> None:
+    """Test seam: forget cached state and warn-once bookkeeping."""
+    _burn_breaker_cache.clear()
+    _burn_breaker_warned.clear()
+    _burn_breaker_last_latched_warn.clear()
+
+
+def burn_breaker_state_path() -> Optional[Path]:
+    """Resolved breaker state-file path, or ``None`` when the check is disabled."""
+    raw: Optional[str] = os.environ.get(BURN_BREAKER_STATE_ENV)
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            kanban_cfg = (load_config_readonly() or {}).get("kanban") or {}
+            cfg_val = kanban_cfg.get(BURN_BREAKER_STATE_CONFIG_KEY)
+            if cfg_val is not None:
+                raw = str(cfg_val)
+        except Exception:
+            raw = None
+    if raw is None:
+        return Path.home().joinpath(*_BURN_BREAKER_DEFAULT_PARTS)
+    if raw.strip().lower() in _BURN_BREAKER_DISABLED_VALUES:
+        return None
+    return Path(raw.strip()).expanduser()
+
+
+def _parse_burn_breaker_state(raw: str) -> bool:
+    """``True`` iff ``raw`` is a JSON object with ``tripped`` exactly ``true``.
+
+    Raises ``ValueError`` for anything that is not a JSON object carrying a
+    ``tripped`` key, so the caller can fail open with a warning.
+    """
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+    if "tripped" not in data:
+        raise ValueError("no 'tripped' key")
+    return data.get("tripped") is True
+
+
+def _burn_breaker_fail_open(key: str, fault: str, detail: object) -> bool:
+    if (key, fault) not in _burn_breaker_warned:
+        _burn_breaker_warned.add((key, fault))
+        _kb._log.warning(
+            "kanban dispatch: burn breaker state file %s %s (%s); failing open "
+            "— dispatch continues unlatched", key, fault, detail,
+        )
+    return False
+
+
+def burn_breaker_latched() -> bool:
+    """Whether the external burn circuit breaker is latched (fail-open)."""
+    path = burn_breaker_state_path()
+    if path is None:
+        return False
+    key = str(path)
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        _burn_breaker_cache[key] = (None, False)
+        return _burn_breaker_fail_open(key, "is missing", "not found")
+    except OSError as exc:
+        _burn_breaker_cache.pop(key, None)
+        return _burn_breaker_fail_open(key, "is unreadable", exc)
+    sig = (int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0) or 0))
+    cached = _burn_breaker_cache.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _burn_breaker_cache.pop(key, None)
+        return _burn_breaker_fail_open(key, "is unreadable", exc)
+    try:
+        latched = _parse_burn_breaker_state(raw)
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+        # Cache the verdict for this signature: a malformed file is not
+        # re-parsed every tick, only when it changes.
+        _burn_breaker_cache[key] = (sig, False)
+        return _burn_breaker_fail_open(key, "is malformed", exc)
+    _burn_breaker_cache[key] = (sig, latched)
+    # A clean read re-arms the warn-once faults for this path.
+    for item in [w for w in _burn_breaker_warned if w[0] == key]:
+        _burn_breaker_warned.discard(item)
+    if not latched and _burn_breaker_last_latched_warn.pop(key, None) is not None:
+        _kb._log.info("kanban dispatch: burn breaker re-armed (%s); spawning resumes", key)
+    return latched
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2509,6 +2641,23 @@ def _tick_spawn_budget(
     # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
     running_count = 0
     spawn_budget: Optional[int] = None
+    # Burn-breaker latch: spawn nothing while the external cost breaker is
+    # tripped (it would SIGTERM the worker anyway). Fail-open + mtime-cached;
+    # reclaim/promotion already ran, so cards wait in ``ready``.
+    if burn_breaker_latched():
+        result.burn_breaker_latched = True
+        path = burn_breaker_state_path()
+        key = str(path)
+        now = time.time()
+        last = _burn_breaker_last_latched_warn.get(key)
+        if last is None or now - last >= _BURN_BREAKER_LATCHED_REWARN_SECONDS:
+            _burn_breaker_last_latched_warn[key] = now
+            _kb._log.warning(
+                "kanban dispatch: burn breaker latched (%s reports tripped=true); "
+                "spawning no new workers (deferred, not dropped) until it is re-armed",
+                key,
+            )
+        return False, None
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
