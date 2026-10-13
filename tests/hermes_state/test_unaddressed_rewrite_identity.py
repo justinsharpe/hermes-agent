@@ -83,3 +83,19 @@ def test_fresh_identical_message_is_never_adopted_by_payload(db):
     assert db.append_messages_batch(sid, [second]) == 1
 
     assert len(_active_rows(db, sid)) == 2
+
+
+def test_born_durable_projection_is_never_reinserted(db):
+    """The re-insert guard keys on the born-durable marker, not a bare uid: a durable projection
+    handed back to append_messages_batch (no row address, no CAS snapshot) is skipped, while a fresh
+    message with a copied uid is always inserted (the test above)."""
+    sid = "born-durable"
+    db.create_session(sid, "desktop")
+    assert db.append_messages_batch(sid, [{"role": "user", "content": "kept", "timestamp": 1000.0}]) == 1
+
+    # The default projection stamps _db_persisted but no _row_id/DB_ROW_SNAPSHOT.
+    restored = db.get_messages_as_conversation(sid)
+    assert restored and all(m.get(_DB_PERSISTED_MARKER) for m in restored)
+
+    assert db.append_messages_batch(sid, restored) == 0
+    assert len(_active_rows(db, sid)) == 1

@@ -122,7 +122,9 @@ def resolve_and_repair_transcript_batch(
     its physical ``_row_id``, the pair (logical ``message_uid``, stored-row snapshot) recovers the newest
     active generation without matching mutable payload. Watermark-compaction clones are matched by their
     copied payload identity, not timestamp alone. Legacy blank assistant rows retain the narrow interrupted-
-    stream content repair. Returns only rows that need fresh inserts.
+    stream content repair. A born-durable dict (``_DB_PERSISTED_MARKER``) with no row address and no CAS
+    snapshot is already in the store and is skipped, never re-INSERTed. Returns only rows that need fresh
+    inserts.
     """
     inserted_rows: list[dict[str, Any]] = []
     for msg in messages:
@@ -137,6 +139,12 @@ def resolve_and_repair_transcript_batch(
             # has neither proof, even when role/content/timestamp happen to equal an older message exactly.
             target_row = _active_logical_message_row(conn, session_id, role, message_uid_or_none(msg))
         if target_row is None:
+            if isinstance(msg, dict) and msg.get(_DB_PERSISTED_MARKER):
+                # Born durable (stamped by _rows_to_conversation), no row address, no CAS snapshot: the
+                # row is already in the store, so never re-insert it. The marker — not a bare message_uid —
+                # is the proof: a fresh message never carries it, so a fresh append (even one that copied a
+                # message_uid) is always inserted, honoring the #129065 contract.
+                continue
             inserted_rows.append(msg)
             continue
 
